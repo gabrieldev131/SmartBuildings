@@ -2,7 +2,7 @@
 
 # --- Configurações de Rede ---
 NETWORK_BASE = "10.145.80"
-IP_RANGE_TO_SCAN = range(1, 255) 
+IP_RANGE_TO_SCAN = range(51, 52) 
 RTSP_PORT = 554
 
 # --- Credenciais das Câmeras ---
@@ -15,10 +15,29 @@ USE_MULTIPROCESSING = True
 # Número de processos trabalhadores. None usa o número de núcleos da CPU.
 NUM_WORKER_PROCESSES = 1
 # Roda a detecção pesada a cada N frames. Nos outros, usa o rastreamento.
-DETECT_EVERY_N_FRAMES = 15
+DETECT_EVERY_N_FRAMES = 30
 
 # Tipo de rastreador a ser usado pelo OpenCV. CSRT é preciso, KCF é mais rápido.
 TRACKER_TYPE = "CSRT" # Opções: "CSRT", "KCF", "MOSSE"
+
+# --- CONFIGURAÇÕES DE DETECÇÃO DE PARADA ---
+# Tempo em segundos que uma pessoa deve ficar parada para ser marcada.
+STOPPED_SECONDS_THRESHOLD = 2.0
+# Distância máxima (em pixels) que o centro de uma pessoa pode se mover
+# para ainda ser considerada "parada". Ajuste conforme a resolução e a cena.
+STOPPED_PIXEL_THRESHOLD = 15
+# Limiar de "movimento significativo". Acima disso, o estado "parado" é quebrado instantaneamente.
+# Deve ser maior que o STOPPED_PIXEL_THRESHOLD.
+MOVEMENT_BREAKOUT_THRESHOLD = 30
+# Cor do contorno para pessoas paradas (BGR - Azul, Verde, Vermelho)
+STOPPED_BOX_COLOR = (0, 0, 255) # Vermelho
+# Número de frames consecutivos de baixa movimentação necessários
+# para confirmar o estado "parado". Suaviza o "jitter".
+STOPPED_HYSTERESIS_FRAMES = 4
+# Fator de suavização para a caixa delimitadora (0 < valor < 1).
+# Valores mais altos = movimento mais suave, mas com mais "atraso".
+# Um bom valor para começar é 0.7
+BOX_SMOOTHING_FACTOR = 0.9
 
 # --- Configurações de Captura ---
 CAPTURE_INTERVAL_SECONDS = 60 # 1 minuto

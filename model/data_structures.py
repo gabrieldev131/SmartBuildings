@@ -3,6 +3,34 @@
 from dataclasses import dataclass
 import numpy as np
 
+import time
+
+class StatefulTimer:
+    """Encapsula a lógica de um temporizador que pode ser iniciado, resetado e verificado."""
+    def __init__(self):
+        self._start_time = None
+
+    def start_if_needed(self):
+        """Inicia o temporizador se ele ainda não estiver rodando."""
+        if self._start_time is None:
+            self._start_time = time.time()
+
+    def return_time_elapsed(self) -> float:
+        """Retorna o tempo decorrido desde o início do temporizador."""
+        if self._start_time is None:
+            return 0.0
+        return time.time() - self._start_time
+    
+    def reset(self):
+        """Reseta o temporizador."""
+        self._start_time = None
+
+    def has_exceeded(self, duration_seconds: float) -> bool:
+        """Verifica se o tempo decorrido desde o início excedeu a duração especificada."""
+        if self._start_time is None:
+            return False
+        return (time.time() - self._start_time) > duration_seconds
+    
 @dataclass
 class BoundingBox:
     """Representa uma caixa delimitadora com coordenadas e dimensões."""
