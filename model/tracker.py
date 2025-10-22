@@ -4,6 +4,7 @@ import numpy as np
 import time
 from collections import deque
 from model.data_structures import BoundingBox, StatefulTimer
+import config
 
 class StatefulTracker:
     _next_id = 0
@@ -70,8 +71,16 @@ class StatefulTracker:
         self.points_to_track = good_new.reshape(-1, 1, 2)
         self.history.append((time.time(), self.get_centroid()))
         self.last_gray_frame = new_frame_gray
-
+        
         self._check_if_stopped(stop_thresh_px, breakout_thresh_px, stop_thresh_sec)
+
+
+        # "Debugging"
+        distance = self._calculate_movement_distance()
+        print(f"Tracker {self.id} - Distance moved: {distance} pixels - Time: {self.stopped_timer.return_time_elapsed()}.")
+
+
+
 
         return (True, self.box.to_tuple(), self.is_stopped)
 
@@ -80,7 +89,7 @@ class StatefulTracker:
         Orquestra a lógica de verificação de parada, delegando para métodos de estado.
         """
         distance = self._calculate_movement_distance()
-        if distance is None:
+        if distance == None:
             return
 
         if self.is_stopped:
@@ -98,13 +107,12 @@ class StatefulTracker:
     def _calculate_movement_distance(self):
         """Calcula a distância percorrida na janela de tempo do histórico."""
         current_time = time.time()
-        time_window = 2.0
+        time_window = 2.0  
         
         recent_history = [item for item in self.history if current_time - item[0] <= time_window]
 
         if len(recent_history) < 2:
             return None
-
         start_point = recent_history[0][1]
         end_point = recent_history[-1][1]
         return np.sqrt((start_point[0] - end_point[0])**2 + (start_point[1] - end_point[1])**2)
@@ -117,6 +125,8 @@ class StatefulTracker:
 
     def _process_moving_state(self, distance, stop_threshold, seconds_threshold):
         """Lida com a lógica quando o estado atual é 'movendo'."""
+        if distance == None:
+            return
         is_moving_slowly = distance < stop_threshold
         if not is_moving_slowly:
             self.stopped_timer.reset()
@@ -134,3 +144,15 @@ class StatefulTracker:
     def _transition_to_stopped(self):
         """Muda o estado para 'parado'."""
         self.is_stopped = True
+        config.TEST = False
+    
+    def get_time(self):
+        return self.stopped_timer
+    def get_state(self):
+        return self.is_stopped
+    
+
+    def reload_time(self, time_elapsed):
+        self.stopped_timer = time_elapsed
+    def reload_state(self, state):
+        self.is_stopped = state

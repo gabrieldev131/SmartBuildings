@@ -106,13 +106,7 @@ class AppController:
                 self._view.show_frame(f"Camera {source_id}", processed_frame)
         except queue.Empty:
             # É normal a fila estar vazia às vezes, apenas continuamos.
-            pass
-            
-    def _results_callback(self, result):
-        """Callback para receber os resultados da detecção do pool de processos."""
-        source_id, boxes = result
-        if source_id in self.camera_processors:
-            self.camera_processors[source_id].update_trackers(boxes)
+            pass          
 
     # --- MÉTODOS AUXILIARES DE ENCERRAMENTO ---
     def _shutdown_process_pool(self):

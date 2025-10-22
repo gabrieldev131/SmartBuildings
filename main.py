@@ -12,6 +12,7 @@ if __name__ == "__main__":
 
     view = ConsoleView()
     
+    
     scanner = NetworkScanner(
         config.NETWORK_BASE, config.IP_RANGE_TO_SCAN, config.RTSP_PORT
     )
