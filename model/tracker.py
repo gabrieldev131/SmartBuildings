@@ -3,7 +3,8 @@ import cv2
 import numpy as np
 import time
 from collections import deque
-from model.data_structures import BoundingBox, StatefulTimer
+from model.DataStructures.BoundingBox import BoundingBox
+from model.DataStructures.StatefulTimer import StatefulTimer
 import config
 
 class StatefulTracker:

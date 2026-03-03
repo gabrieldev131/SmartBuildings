@@ -1,7 +1,7 @@
 # config.py
 # --- Configurações de Rede ---
 NETWORK_BASE = "10.145.80"
-IP_RANGE_TO_SCAN = range(51, 52) 
+IP_RANGE_TO_SCAN = range(50, 53) 
 RTSP_PORT = 554
 
 # --- Credenciais das Câmeras ---
