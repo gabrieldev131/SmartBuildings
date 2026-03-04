@@ -14,7 +14,7 @@ USE_MULTIPROCESSING = True
 # Número de processos trabalhadores. None usa o número de núcleos da CPU.
 NUM_WORKER_PROCESSES = 1
 # Roda a detecção pesada a cada N frames. Nos outros, usa o rastreamento.
-DETECT_EVERY_N_FRAMES = 30
+DETECT_EVERY_N_FRAMES = 20
 
 # Tipo de rastreador a ser usado pelo OpenCV. CSRT é preciso, KCF é mais rápido.
 TRACKER_TYPE = "CSRT" # Opções: "CSRT", "KCF", "MOSSE"
