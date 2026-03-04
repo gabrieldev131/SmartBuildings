@@ -73,3 +73,25 @@ PERSON_CLASS_ID = 15
 
 # Cor do contorno do quadrado (BGR - Azul, Verde, Vermelho)
 PERSON_BOX_COLOR = (0, 255, 0) # Verde
+
+# ---------------------------------------------------------------------------
+# Configuracoes do Kafka (fonte de frames)
+# ---------------------------------------------------------------------------
+
+# Endereco do broker Kafka. Em Docker, use o nome do servico (ex: "kafka:9092").
+# Localmente: "localhost:9092"
+KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+
+# Topico onde o produtor publica os frames JPEG das cameras.
+KAFKA_TOPIC = "meu-topico-de-video"
+
+# Consumer group. Mude se quiser duas instancias independentes lendo o mesmo topico.
+KAFKA_GROUP_ID = "smart-builds-consumer"
+
+# (Opcional) Se definido, o KafkaFrameReader ignora todas as cameras exceto esta.
+# None = consome todas as cameras presentes no topico.
+KAFKA_TARGET_CAMERA = None  # Ex: "cam3"
+
+# Estimativa de cameras no topico. Usado para dimensionar a fila interna.
+# Nao precisa ser exato: errar para cima e seguro.
+KAFKA_EXPECTED_CAMERAS = 4
