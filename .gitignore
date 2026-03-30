@@ -209,3 +209,6 @@ __marimo__/
 # images
 capturas_mvc/
 dnn_model/
+
+# DNN models
+yolov8n.pt
