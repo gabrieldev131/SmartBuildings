@@ -5,7 +5,7 @@ import time
 from collections import deque
 from model.DataStructures.BoundingBox import BoundingBox
 from model.DataStructures.StatefulTimer import StatefulTimer
-import config
+
 
 
 class StatefulTracker:

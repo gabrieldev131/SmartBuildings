@@ -47,6 +47,7 @@ class CameraProcessor:
             embedder="mobilenet",
             half=True,
             bgr=True,
+            embedder_gpu=True,
         )
         self.current_tracks = []
 
