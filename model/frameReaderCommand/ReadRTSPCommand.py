@@ -3,7 +3,7 @@ import cv2
 import logging
 import time
 from queue import Queue, Full
-from .IFrameCommand import IFrameCommand
+from model.frameReaderCommand.IFrameCommand import IFrameCommand
 
 class ReadRTSPCommand(IFrameCommand):
     """

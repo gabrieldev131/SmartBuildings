@@ -1,7 +1,7 @@
 # model/invokers/FrameReaderInvoker.py
 import threading
 import logging
-from .IFrameCommand import IFrameCommand
+from model.frameReaderCommand.IFrameCommand import IFrameCommand
 
 class FrameReaderInvoker(threading.Thread):
     """

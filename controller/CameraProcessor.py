@@ -21,7 +21,7 @@ class CameraProcessor:
         # Sem o lock, ambas podem ler/escrever pending_detections ao mesmo tempo.
         self._detection_lock = detection_lock
         self._pending_detections = None
-
+        self._frame_for_tracker = None
         # --- Parametros do DeepSORT ---
         # max_age: quantos frames o tracker sobrevive SEM ser associado a uma deteccao.
         #   Regra: deve ser BEM maior que DETECT_EVERY_N_FRAMES para aguentar
@@ -41,13 +41,13 @@ class CameraProcessor:
         #   tornando a re-identificacao mais robusta que so posicao.
         self.tracker = DeepSort(
             max_age=90,
-            n_init=3,
-            nms_max_overlap=0.4,
-            max_cosine_distance=0.3,
+            n_init=2,
+            nms_max_overlap=1.0,
+            max_cosine_distance=0.6,
             embedder="mobilenet",
             half=True,
             bgr=True,
-            embedder_gpu=True,
+            embedder_gpu=True
         )
         self.current_tracks = []
 
@@ -71,6 +71,9 @@ class CameraProcessor:
         self.frame_counter += 1
 
         if self._is_detection_frame() and self.config.USE_MULTIPROCESSING and detection_pool:
+            # CORREÇÃO TEMPORAL: Guardamos o frame EXATO em que a pessoa se encontra agora
+            self._frame_for_tracker = frame.copy() 
+            
             detection_pool.apply_async(
                 detect_people_in_frame,
                 args=(frame, self.config.YOLO_CONFIDENCE_THRESHOLD, self.config.YOLO_NMS_THRESHOLD),
@@ -78,12 +81,19 @@ class CameraProcessor:
                 error_callback=self._on_detection_error
             )
 
-        # CORRECAO: Acesso a _pending_detections protegido pelo lock.
         with self._detection_lock:
             if self._pending_detections is not None:
+                # Usa o frame guardado para extrair as características corretamente.
+                # Se por algum motivo não existir, usa o atual como fallback de segurança.
+                track_frame = self._frame_for_tracker if self._frame_for_tracker is not None else frame
+                
                 self.current_tracks = self.tracker.update_tracks(
-                    self._pending_detections, frame=frame)
+                    self._pending_detections, frame=track_frame
+                )
+                
+                # Limpa os estados após a atualização
                 self._pending_detections = None
+                self._frame_for_tracker = None
 
         boxes_and_states = self._build_boxes_and_states()
         processed_frame = self._draw_boxes(frame, boxes_and_states)

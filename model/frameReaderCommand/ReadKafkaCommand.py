@@ -4,7 +4,7 @@ import numpy as np
 import logging
 from multiprocessing import Queue as MPQueue
 from confluent_kafka import Consumer
-from .IFrameCommand import IFrameCommand
+from model.frameReaderCommand.IFrameCommand import IFrameCommand
 
 class ReadKafkaCommand(IFrameCommand):
     """
