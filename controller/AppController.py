@@ -12,6 +12,7 @@ from controller.CameraProcessor import CameraProcessor
 from model.frameReaderCommand.ReadKafkaCommand import ReadKafkaCommand
 from model.frameReaderCommand.FrameReaderInvoker import FrameReaderInvoker
 
+from model.GlobalIdentityManager import GlobalIdentityManager
 
 class AppController:
     """
@@ -30,11 +31,10 @@ class AppController:
         self.camera_processors: dict[str, CameraProcessor] = {}
         self.raw_frames_queue: MPQueue = None
         self.stop_event: threading.Event = None
-        
-        # Substituímos o leitor específico por um Invoker genérico
         self._reader_invoker: FrameReaderInvoker = None
-        
         self.pool: Pool = None
+
+        self.global_id_manager = GlobalIdentityManager(similarity_threshold=0.4)
 
         # Métricas de performance
         self._fps_counter = 0
@@ -143,8 +143,17 @@ class AppController:
                 logging.info(f"Nova câmara detetada: '{cam_id}'")
                 self._view.display_message(f"Câmara '{cam_id}' ligada.")
                 detection_lock = threading.Lock()
+                
+                # -------------------------------------------------------------
+                # INTEGRAÇÃO: Injetamos o global_id_manager no construtor
+                # Assim, todos os CameraProcessors conversam com o mesmo objeto.
+                # -------------------------------------------------------------
                 self.camera_processors[cam_id] = CameraProcessor(
-                    cam_id, self._config, detection_lock)
+                    cam_id, 
+                    self._config, 
+                    detection_lock,
+                    global_id_manager=self.global_id_manager # <--- INJEÇÃO AQUI
+                )
 
             processor = self.camera_processors[cam_id]
             processed_frame = processor.process_frame(frame, self.pool)

@@ -10,7 +10,7 @@ from model.ProcessingWorker import detect_people_in_frame
 
 
 class CameraProcessor:
-    def __init__(self, source_id, config, detection_lock: threading.Lock):
+    def __init__(self, source_id, config, detection_lock: threading.Lock, global_id_manager=None):
         self.source_id = source_id
         self.config = config
         self.frame_counter = 0
@@ -22,6 +22,9 @@ class CameraProcessor:
         self._detection_lock = detection_lock
         self._pending_detections = None
         self._frame_for_tracker = None
+
+        self.global_id_manager = global_id_manager
+        self.local_to_global_map = {}
         # --- Parametros do DeepSORT ---
         # max_age: quantos frames o tracker sobrevive SEM ser associado a uma deteccao.
         #   Regra: deve ser BEM maior que DETECT_EVERY_N_FRAMES para aguentar
@@ -123,7 +126,7 @@ class CameraProcessor:
     # -------------------------------------------------------------------------
 
     def _build_boxes_and_states(self):
-        """Itera sobre tracks confirmados e calcula estado de parada."""
+        """Itera sobre tracks confirmados e calcula estado de parada com IDs Globais."""
         boxes_and_states = []
         current_time = time.time()
 
@@ -131,17 +134,39 @@ class CameraProcessor:
             if not track.is_confirmed() or track.time_since_update > 15:
                 continue
 
-            track_id = track.track_id
+            local_id = track.track_id
             ltrb = track.to_ltrb()
             x, y = int(ltrb[0]), int(ltrb[1])
             w, h = int(ltrb[2] - ltrb[0]), int(ltrb[3] - ltrb[1])
             box = [x, y, w, h]
 
-            self._update_position_history(track_id, box, current_time)
-            is_stopped = self._evaluate_stopped_state(track_id, current_time)
-            elapsed = self._get_stopped_elapsed(track_id, current_time)
+            # --- LÓGICA DE RE-IDENTIFICAÇÃO ---
+            display_id = local_id # Fallback de segurança
 
-            boxes_and_states.append((box, is_stopped, track_id, elapsed))
+            if self.global_id_manager is not None:
+                if local_id not in self.local_to_global_map:
+                    if track.features:
+                        latest_feature = track.features[-1]
+                        global_id = self.global_id_manager.get_or_create_global_id(latest_feature)
+                        self.local_to_global_map[local_id] = global_id
+                        display_id = global_id
+                    else:
+                        # CORREÇÃO: Usamos o ID local apenas para mostrar na tela neste frame, 
+                        # mas NÃO o guardamos no dicionário! Assim, no próximo frame 
+                        # ele volta a tentar extrair e enviar para o Gestor Global.
+                        display_id = local_id 
+                else:
+                    # Se já foi mapeado com sucesso antes, usa a tradução
+                    display_id = self.local_to_global_map[local_id]
+            else:
+                display_id = local_id # Caso o gestor não exista
+
+            # --- ATUALIZAR ESTADOS COM O ID GLOBAL ---
+            self._update_position_history(display_id, box, current_time)
+            is_stopped = self._evaluate_stopped_state(display_id, current_time)
+            elapsed = self._get_stopped_elapsed(display_id, current_time)
+
+            boxes_and_states.append((box, is_stopped, display_id, elapsed))
 
         return boxes_and_states
 
@@ -234,9 +259,18 @@ class CameraProcessor:
         return self.frame_counter % self.config.DETECT_EVERY_N_FRAMES == 0
 
     def _cleanup_old_states(self, active_track_ids):
-        """Remove historico de IDs que sairam de cena."""
-        inactive = [tid for tid in self._position_history if tid not in active_track_ids]
-        for tid in inactive:
-            self._position_history.pop(tid, None)
-            self._stopped_state.pop(tid, None)
-            self._stopped_since.pop(tid, None)
+        """Remove histórico de IDs Globais que saíram de cena."""
+        # active_track_ids contém os IDs locais do DeepSORT que ainda estão visíveis.
+        
+        # Descobre quais IDs locais desapareceram
+        inactive_locals = [tid for tid in self.local_to_global_map if tid not in active_track_ids]
+        
+        for local_tid in inactive_locals:
+            # Remove o ID local do mapa de tradução e recupera o ID Global
+            global_tid = self.local_to_global_map.pop(local_tid, None)
+            
+            # Limpa o histórico de posições usando o ID Global
+            if global_tid is not None:
+                self._position_history.pop(global_tid, None)
+                self._stopped_state.pop(global_tid, None)
+                self._stopped_since.pop(global_tid, None)
