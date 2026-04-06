@@ -24,7 +24,7 @@ class AppController:
         e passa-o para um Invoker (FrameReaderInvoker) executar numa thread isolada.
     """
 
-    def __init__(self, model, view, config):
+    def __init__(self, view, config):
         self._view = view
         self._config = config
 
@@ -91,14 +91,14 @@ class AppController:
     # -------------------------------------------------------------------------
     # SETUP
     # -------------------------------------------------------------------------
+    
 
     def _start_frame_reader(self):
         """
         Cria a fila partilhada e inicia o Padrão Command para leitura de frames.
         """
-        estimated_cameras = getattr(self._config, "KAFKA_EXPECTED_CAMERAS", 4)
         self.raw_frames_queue = MPQueue(
-            maxsize=estimated_cameras * self._config.BUFFER_SIZE)
+            maxsize=60)
 
         # 1. Instanciamos o Comando (A intenção do que queremos fazer)
         kafka_command = ReadKafkaCommand(

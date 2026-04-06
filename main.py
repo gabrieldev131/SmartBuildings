@@ -18,11 +18,7 @@ def main():
     setup_logging()
     view = ConsoleView()
 
-    # Sem NetworkScanner nem FrameReader: a fonte de dados agora e o Kafka.
-    # O AppController instancia o KafkaFrameReader internamente.
-    model = {}
-
-    controller = AppController(model, view, config)
+    controller = AppController(view, config)
     controller.run()
 
 
