@@ -126,42 +126,56 @@ class CameraProcessor:
     # -------------------------------------------------------------------------
 
     def _build_boxes_and_states(self):
-        """Itera sobre tracks confirmados e calcula estado de parada com IDs Globais."""
+        """Itera sobre tracks confirmados, resolve o Re-ID e remove duplicatas (Ghosts)."""
         boxes_and_states = []
         current_time = time.time()
+        
+        # 1. Agrupar e Deduplicar
+        # Dicionário para manter apenas o melhor track para cada ID Global neste frame
+        best_tracks = {}
 
         for track in self.current_tracks:
             if not track.is_confirmed() or track.time_since_update > 15:
                 continue
 
             local_id = track.track_id
-            ltrb = track.to_ltrb()
-            x, y = int(ltrb[0]), int(ltrb[1])
-            w, h = int(ltrb[2] - ltrb[0]), int(ltrb[3] - ltrb[1])
-            box = [x, y, w, h]
 
-            # --- LÓGICA DE RE-IDENTIFICAÇÃO ---
-            display_id = local_id # Fallback de segurança
+            # --- LÓGICA DE RE-IDENTIFICAÇÃO GLOBAL ---
+            display_id = local_id
 
             if self.global_id_manager is not None:
                 if local_id not in self.local_to_global_map:
                     if track.features:
                         latest_feature = track.features[-1]
-                        global_id = self.global_id_manager.get_or_create_global_id(latest_feature)
+                        
+                        global_id = self.global_id_manager.get_or_create_global_id(
+                            new_feature_vector=latest_feature,
+                            cam_id=self.source_id, 
+                            current_time=current_time
+                        )
                         self.local_to_global_map[local_id] = global_id
                         display_id = global_id
                     else:
-                        # CORREÇÃO: Usamos o ID local apenas para mostrar na tela neste frame, 
-                        # mas NÃO o guardamos no dicionário! Assim, no próximo frame 
-                        # ele volta a tentar extrair e enviar para o Gestor Global.
                         display_id = local_id 
                 else:
-                    # Se já foi mapeado com sucesso antes, usa a tradução
                     display_id = self.local_to_global_map[local_id]
-            else:
-                display_id = local_id # Caso o gestor não exista
 
-            # --- ATUALIZAR ESTADOS COM O ID GLOBAL ---
+            # --- O NOVO FILTRO DE FANTASMAS ---
+            if display_id in best_tracks:
+                existing_track = best_tracks[display_id]
+                # Mantém o track que foi detetado pela YOLO mais recentemente (menor tempo às cegas)
+                if track.time_since_update < existing_track.time_since_update:
+                    best_tracks[display_id] = track
+            else:
+                best_tracks[display_id] = track
+
+        # 2. Processar os estados e histórico APENAS para os tracks vencedores
+        for display_id, track in best_tracks.items():
+            ltrb = track.to_ltrb()
+            x, y = int(ltrb[0]), int(ltrb[1])
+            w, h = int(ltrb[2] - ltrb[0]), int(ltrb[3] - ltrb[1])
+            box = [x, y, w, h]
+
             self._update_position_history(display_id, box, current_time)
             is_stopped = self._evaluate_stopped_state(display_id, current_time)
             elapsed = self._get_stopped_elapsed(display_id, current_time)
