@@ -70,6 +70,8 @@ class AppController:
 
     def _shutdown(self):
         self._view.display_message("A encerrar o sistema...")
+
+        self.global_id_manager.export_data_to_csv("dados_rastreamento.csv")
         if self.stop_event and not self.stop_event.is_set():
             self.stop_event.set()
 

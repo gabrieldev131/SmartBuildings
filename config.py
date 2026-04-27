@@ -95,3 +95,5 @@ KAFKA_TARGET_CAMERA = None  # Ex: "cam3"
 # Estimativa de cameras no topico. Usado para dimensionar a fila interna.
 # Nao precisa ser exato: errar para cima e seguro.
 KAFKA_EXPECTED_CAMERAS = 4
+
+YOLO_MODEL_PATH = "yolo26n.pt"

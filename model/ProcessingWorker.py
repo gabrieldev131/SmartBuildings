@@ -5,7 +5,7 @@ from ultralytics import YOLO
 # Variavel global do processo worker. Carregada uma vez por processo via initializer.
 model = None
 
-def initialize_worker(model_path="yolov8n.pt"):
+def initialize_worker(model_path="yolov8s.pt"):
     """
     Inicializa o modelo YOLO (Ultralytics) dentro de cada processo do pool.
     Chamada automaticamente pelo multiprocessing.Pool via 'initializer'.
