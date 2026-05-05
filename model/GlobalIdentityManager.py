@@ -70,6 +70,7 @@ class GlobalIdentityManager:
 
             all_records = []
             for identity in self.identities.values():
+                #identity.print_summary()  # Imprime o resumo para o console
                 all_records.extend(identity.get_raw_history())
 
             if not all_records:

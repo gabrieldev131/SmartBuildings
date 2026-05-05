@@ -215,6 +215,7 @@ yolov8n.pt
 yolov8s.pt
 yolo26n.pt
 yolo26x.pt
+yolo26s.pt
 
 # Dados de rastreamento
 *.csv

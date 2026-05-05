@@ -14,7 +14,7 @@ USE_MULTIPROCESSING = True
 # Número de processos trabalhadores. None usa o número de núcleos da CPU.
 NUM_WORKER_PROCESSES = 1
 # Roda a detecção pesada a cada N frames. Nos outros, usa o rastreamento.
-DETECT_EVERY_N_FRAMES = 20
+DETECT_EVERY_N_FRAMES = 6
 
 # Tipo de rastreador a ser usado pelo OpenCV. CSRT é preciso, KCF é mais rápido.
 TRACKER_TYPE = "CSRT" # Opções: "CSRT", "KCF", "MOSSE"
@@ -36,10 +36,10 @@ STOPPED_HYSTERESIS_FRAMES = 3
 # Fator de suavização para a caixa delimitadora (0 < valor < 1).
 # Valores mais altos = movimento mais suave, mas com mais "atraso".
 # Um bom valor para começar é 0.7
-BOX_SMOOTHING_FACTOR = 0.9
+BOX_SMOOTHING_FACTOR = 0.7
 # Limiar de Intersection over Union (IoU) para associar uma detecção YOLO
 # a um rastreador existente. Valores típicos: 0.3 a 0.5
-IOU_THRESHOLD = 0.4
+IOU_THRESHOLD = 0.5
 
 # --- Configurações de Captura ---
 CAPTURE_INTERVAL_SECONDS = 60 # 1 minuto
@@ -54,7 +54,7 @@ YOLO_WEIGHTS = "dnn_model/yolov3.weights"
 YOLO_CFG = "dnn_model/yolov3.cfg"
 YOLO_NAMES = "dnn_model/coco.names"
 YOLO_CONFIDENCE_THRESHOLD = 0.5 # Limite de confiança para detecção
-YOLO_NMS_THRESHOLD = 0.4      # Limite para a Supressão Não Máxima (NMS)
+YOLO_NMS_THRESHOLD = 0.3      # Limite para a Supressão Não Máxima (NMS)
 
 # --- Configurações do Modelo de Detecção de Pessoas (DNN) ---
 DNN_MODEL_PROTO = "dnn_model/MobileNetSSD_deploy.prototxt"
@@ -96,4 +96,4 @@ KAFKA_TARGET_CAMERA = None  # Ex: "cam3"
 # Nao precisa ser exato: errar para cima e seguro.
 KAFKA_EXPECTED_CAMERAS = 4
 
-YOLO_MODEL_PATH = "yolo26n.pt"
+YOLO_MODEL_PATH = "yolo26s.pt"

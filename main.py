@@ -13,14 +13,12 @@ def setup_logging():
         datefmt="%H:%M:%S",
     )
 
-
 def main():
     setup_logging()
     view = ConsoleView()
 
     controller = AppController(view, config)
     controller.run()
-
 
 if __name__ == "__main__":
     freeze_support()

@@ -44,7 +44,8 @@ def detect_people_in_frame(frame, confidence_threshold, nms_threshold):
         classes=[0], 
         conf=confidence_threshold, 
         iou=nms_threshold, 
-        verbose=False
+        verbose=False,
+        imgsz=640
     )
 
     formatted_detections = []

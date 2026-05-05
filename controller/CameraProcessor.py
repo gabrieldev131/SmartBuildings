@@ -43,14 +43,11 @@ class CameraProcessor:
         # embedder_wts: usa MobileNet local para extrair features de aparencia,
         #   tornando a re-identificacao mais robusta que so posicao.
         self.tracker = DeepSort(
-            max_age=90,
-            n_init=3,
-            nms_max_overlap=1.0,
-            max_cosine_distance=0.6,
-            embedder="mobilenet",
-            half=True,
-            bgr=True,
-            embedder_gpu=True
+            max_age=70, 
+            embedder='torchreid', 
+            embedder_model_name='osnet_x1_0', 
+            embedder_wts='path/to/osnet_x1_0_msmt17.pth', 
+            half=True
         )
         self.current_tracks = []
 
@@ -144,24 +141,27 @@ class CameraProcessor:
             display_id = local_id
 
             if self.global_id_manager is not None:
-                display_id = self.__global_id_manager(local_id, track, current_time, display_id)
+                if local_id not in self.local_to_global_map:
+                    if track.features:
+                        latest_feature = track.features[-1]
+                        
+                        global_id = self.global_id_manager.get_or_create_global_id(
+                            new_feature_vector=latest_feature,
+                            cam_id=self.source_id, 
+                            current_time=current_time
+                        )
+                        self.local_to_global_map[local_id] = global_id
+                        display_id = global_id
+                    else:
+                        display_id = local_id 
+                else:
+                    display_id = self.local_to_global_map[local_id]
 
             # --- O NOVO FILTRO DE FANTASMAS ---
             if display_id in best_tracks:
                 existing_track = best_tracks[display_id]
-                
-                # EXCEÇÃO DE COLISÃO: Ambas as caixas são reais e detetadas agora (0 frames às cegas)
-                if track.time_since_update == 0 and existing_track.time_since_update == 0:
-                    # A MobileNet enganou-se devido a roupas parecidas. 
-                    # Forçamos esta segunda pessoa a usar o ID local temporariamente para não ser apagada.
-                    display_id = local_id
-                    
-                    # Removemos a tradução errada para a rede tentar extrair as cores melhor no próximo frame
-                    self.local_to_global_map.pop(local_id, None)
-                    best_tracks[display_id] = track
-                    
-                # CASO FANTASMA: Uma das caixas é uma previsão velha. Mantemos a mais fresca.
-                elif track.time_since_update < existing_track.time_since_update:
+                # Mantém o track que foi detetado pela YOLO mais recentemente (menor tempo às cegas)
+                if track.time_since_update < existing_track.time_since_update:
                     best_tracks[display_id] = track
             else:
                 best_tracks[display_id] = track

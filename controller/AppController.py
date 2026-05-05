@@ -11,6 +11,7 @@ from controller.CameraProcessor import CameraProcessor
 # Importações do novo padrão Command
 from model.frameReaderCommand.ReadKafkaCommand import ReadKafkaCommand
 from model.frameReaderCommand.FrameReaderInvoker import FrameReaderInvoker
+from model.frameReaderCommand.ReadRTSPCommand import ReadRTSPCommand
 
 from model.GlobalIdentityManager import GlobalIdentityManager
 
@@ -103,23 +104,36 @@ class AppController:
             maxsize=60)
 
         # 1. Instanciamos o Comando (A intenção do que queremos fazer)
-        kafka_command = ReadKafkaCommand(
+        """ kafka_command = ReadKafkaCommand(
+                output_queue=self.raw_frames_queue,
+                bootstrap_servers=self._config.KAFKA_BOOTSTRAP_SERVERS,
+                topic=self._config.KAFKA_TOPIC,
+                group_id=self._config.KAFKA_GROUP_ID,
+                width=self._config.PROCESSING_WIDTH,
+                height=self._config.PROCESSING_HEIGHT,
+                target_camera_id=getattr(self._config, "KAFKA_TARGET_CAMERA", None)
+            )
+
+            # 2. Instanciamos o Invoker (Quem gere a thread e executa o comando)
+            self._reader_invoker = FrameReaderInvoker(
+                command=kafka_command,
+                stop_event=self.stop_event,
+                name="KafkaReaderInvoker"
+            )"""
+        
+        # Exemplo de como iniciar um comando por video em vez do Kafka
+        video_command = ReadRTSPCommand(
             output_queue=self.raw_frames_queue,
-            bootstrap_servers=self._config.KAFKA_BOOTSTRAP_SERVERS,
-            topic=self._config.KAFKA_TOPIC,
-            group_id=self._config.KAFKA_GROUP_ID,
+            source="pessoas_rua_60fps.mp4",  # Pode ser um URL RTSP real ou um caminho para um vídeo local
             width=self._config.PROCESSING_WIDTH,
             height=self._config.PROCESSING_HEIGHT,
-            target_camera_id=getattr(self._config, "KAFKA_TARGET_CAMERA", None)
         )
 
-        # 2. Instanciamos o Invoker (Quem gere a thread e executa o comando)
         self._reader_invoker = FrameReaderInvoker(
-            command=kafka_command,
+            command=video_command,
             stop_event=self.stop_event,
-            name="KafkaReaderInvoker"
+            name="VideoReaderInvoker"
         )
-        
         # 3. Iniciamos a thread
         self._reader_invoker.start()
 
