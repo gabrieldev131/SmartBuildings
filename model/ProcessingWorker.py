@@ -38,14 +38,8 @@ def detect_people_in_frame(frame, confidence_threshold, nms_threshold):
 
     # O parametro classes=[0] diz à ultralytics para filtrar SOMENTE pessoas.
     # O parametro iou=nms_threshold ajusta o Non-Maximum Suppression interno.
-    results = model(
+    results = model.track(
         frame, 
-        stream=True, 
-        classes=[0], 
-        conf=confidence_threshold, 
-        iou=nms_threshold, 
-        verbose=False,
-        imgsz=640
     )
 
     formatted_detections = []
