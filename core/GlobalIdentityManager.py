@@ -109,7 +109,7 @@ class GlobalIdentityManager:
     # -------------------------------------------------------------------------
     # EXPORTAÇÃO DE DADOS
     # -------------------------------------------------------------------------
-    def export_data_to_csv(self, filename="tracking_data.csv"):
+    def export_data_to_csv(self, filename="dados_rastreamento.csv"):
         """
         Exporta todo o histórico de movimentos para um ficheiro CSV.
         Este ficheiro será a base para o algoritmo de Cadeia de Markov.
