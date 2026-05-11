@@ -34,3 +34,5 @@ class Config:
     # Capturas
     PROCESSING_WIDTH = 640
     PROCESSING_HEIGHT = 480
+
+    CAMERA_SWITCH_COOLDOWN = 2.0  # Tempo mínimo (em segundos) entre mudanças de câmera para o mesmo ID global.
