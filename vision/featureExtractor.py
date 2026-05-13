@@ -29,6 +29,6 @@ def extract_color_histogram(frame: np.ndarray, box: list) -> np.ndarray:
     hsv_crop = cv2.cvtColor(blurred_crop, cv2.COLOR_BGR2HSV)
     
     hist = cv2.calcHist([hsv_crop], [0, 1, 2], None, [16, 8, 8], [0, 180, 0, 256, 0, 256])
-    cv2.normalize(hist, hist)
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
     
     return hist.flatten()

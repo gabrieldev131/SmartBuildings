@@ -42,7 +42,7 @@ class FrameReaderManagement:
         """Inicializa a abstração de extração de frames (Command Pattern)."""
         
         # Exemplo com RTSP (Poderia ser o ReadKafkaCommand)
-        video_command = ReadRTSPCommand(
+        """video_command = ReadRTSPCommand(
             source="examples/pessoas_rua_60fps.mp4", 
             output_queue=self.raw_frames_queue,
             width=640,
@@ -53,9 +53,9 @@ class FrameReaderManagement:
             command=video_command,
             stop_event=self.stop_event,
             name="VideoReaderInvoker"
-        )
+        )"""
 
-        """kafka_command = ReadKafkaCommand(
+        kafka_command = ReadKafkaCommand(
             output_queue=self.raw_frames_queue,
             bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
             topic=self.config.KAFKA_TOPIC,
@@ -69,7 +69,8 @@ class FrameReaderManagement:
             command=kafka_command,
             stop_event=self.stop_event,
             name="VideoReaderInvoker"
-        )"""
+        )
+
         self._reader_invoker.start()
 
     def _main_routing_loop(self):
@@ -105,24 +106,38 @@ class FrameReaderManagement:
                 try:
                     self.camera_queues[cam_id].put_nowait(frame)
                 except queue.Full:
-                    # Se o Worker estiver lento (GPU estrangulada), descartamos o frame 
-                    # para evitar latência progressiva (Lag).
                     pass
 
             except queue.Empty:
                 pass
             except KeyboardInterrupt:
+                logging.info("Interrupção manual detetada (Ctrl+C). Iniciando encerramento...")
                 self.stop_event.set()
+                break # CORREÇÃO: Sai do loop imediatamente para ir para o _shutdown
 
     def _shutdown(self):
-        logging.info("A encerrar o sistema...")
+        logging.info("A iniciar rotina de encerramento seguro...")
         self.stop_event.set()
 
-        # Aguarda que a extração pare
+        # 1. Aguarda que a extração de frames pare
         if self._reader_invoker:
+            logging.info("A parar captura de vídeo...")
             self._reader_invoker.join(timeout=3)
 
-        # Exporta as estatísticas
+        # 2. CORREÇÃO: Aguarda que TODOS os workers das câmaras terminem
+        # Isso impede que o OpenCV bloqueie ou "morra" de repente, deixando janelas presas.
+        for cam_id, worker in self.camera_workers.items():
+            logging.info(f"A aguardar encerramento seguro da câmara '{cam_id}'...")
+            worker.join(timeout=2)
+
+        # 3. Exporta as estatísticas agora que tudo parou
+        logging.info("A exportar dados para CSV...")
         self.global_id_manager.export_data_to_csv("tracking_data_final.csv")
+        
+        # 4. Destrói as janelas com segurança
         cv2.destroyAllWindows()
-        logging.info("Programa finalizado.")
+        # No macOS/Linux, por vezes é necessário este truque para forçar as janelas a fecharem
+        for i in range(4): 
+            cv2.waitKey(1)
+            
+        logging.info("Programa finalizado com sucesso.")
