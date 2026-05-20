@@ -36,10 +36,15 @@ class CameraWorker(threading.Thread):
             max_cosine_distance=0.2,
             embedder="mobilenet",
             half=True,               
-            bgr=True
+            bgr=True,
+            embedder_gpu=True
         )
 
         print(f"[{self.name}] Iniciado com Deep SORT (Otimizado) a aguardar frames...")
+        
+        # Inicialização das variáveis para cálculo de FPS
+        prev_time = time.time()
+        fps = 0.0
 
         while not self.stop_event.is_set():
             try:
@@ -48,6 +53,12 @@ class CameraWorker(threading.Thread):
                 continue
 
             current_time = time.time()
+            
+            # Atualiza e calcula o FPS atual (com suavização para o número não piscar tanto)
+            frame_time = current_time - prev_time
+            current_fps = 1.0 / frame_time if frame_time > 0 else 0.0
+            fps = 0.9 * fps + 0.1 * current_fps if fps > 0 else current_fps
+            prev_time = current_time
             
             # CORREÇÃO 2: Adição do iou=0.45 no YOLO.
             # Isto impede que o YOLO envie um corpo e um rosto como duas pessoas diferentes.
@@ -131,6 +142,17 @@ class CameraWorker(threading.Thread):
             lost_locals = [lid for lid in self.local_to_global_map if lid not in active_local_ids]
             for lid in lost_locals:
                 del self.local_to_global_map[lid]
+
+            # --- RENDERIZAÇÃO DO HUD (Estatísticas na tela) ---
+            q_size = self.input_queue.qsize()
+            
+            # Desenha um pequeno fundo semi-transparente para o texto ser legível em fundos brancos
+            cv2.rectangle(frame, (5, 5), (160, 65), (0, 0, 0), -1)
+            
+            # Escreve o FPS e o Tamanho da Fila (amarelo)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"Fila: {q_size}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+            # -------------------------------------------------
 
             cv2.imshow(f"Camera {self.cam_id}", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
