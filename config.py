@@ -15,7 +15,7 @@ class Config:
     MAX_SPATIAL_DISTANCE = 150    
     MAX_TIME_LOST = 10.0                 # Aumentado para 10s para permitir que a pessoa ande entre corredores sem câmara
     CAMERA_SWITCH_COOLDOWN = 2.0         # Evita ping-pong entre câmaras com sobreposição
-    AUTO_CLUSTER_TIME_THRESHOLD = 3.0    # Tempo para considerar que duas câmaras filmam o mesmo ambiente
+    AUTO_CLUSTER_TIME_THRESHOLD = 10.0    # Tempo para considerar que duas câmaras filmam o mesmo ambiente
     
     # Interface
     COLOR_STOPPED = (0, 0, 255)  

@@ -42,7 +42,7 @@ class FrameReaderManagement:
         """Inicializa a abstração de extração de frames (Command Pattern)."""
         
         # Exemplo com RTSP (Poderia ser o ReadKafkaCommand)
-        video_command = ReadRTSPCommand(
+        """video_command = ReadRTSPCommand(
             source="examples/pessoas_rua_60fps.mp4", 
             output_queue=self.raw_frames_queue,
             width=640,
@@ -53,9 +53,9 @@ class FrameReaderManagement:
             command=video_command,
             stop_event=self.stop_event,
             name="VideoReaderInvoker"
-        )
+        )"""
 
-        """kafka_command = ReadKafkaCommand(
+        kafka_command = ReadKafkaCommand(
             output_queue=self.raw_frames_queue,
             bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
             topic=self.config.KAFKA_TOPIC,
@@ -69,7 +69,7 @@ class FrameReaderManagement:
             command=kafka_command,
             stop_event=self.stop_event,
             name="VideoReaderInvoker"
-        )"""
+        )
 
         self._reader_invoker.start()
 

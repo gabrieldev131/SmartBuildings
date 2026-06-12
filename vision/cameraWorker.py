@@ -30,9 +30,9 @@ class CameraWorker(threading.Thread):
 
         # CORREÇÃO 1: Ajuste rigoroso da supressão de não-máximos (NMS)
         tracker = DeepSort(
-            max_age=90,
-            n_init=3,
-            nms_max_overlap=0.45,    # <-- MUDADO DE 1.0. Impede caixas sobrepostas na mesma pessoa
+            max_age=300,
+            n_init=6,
+            nms_max_overlap=0.35,    # <-- MUDADO DE 1.0. Impede caixas sobrepostas na mesma pessoa
             max_cosine_distance=0.2,
             embedder="mobilenet",
             half=True,               
