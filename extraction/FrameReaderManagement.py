@@ -21,6 +21,9 @@ class FrameReaderManagement:
         self.config = config
         self.stop_event = threading.Event()
         
+        # No __init__ do FrameReaderManagement
+        self.display_queue = queue.Queue(maxsize=100)
+
         # Fila onde os Comandos colocam as imagens brutas
         self.raw_frames_queue = queue.Queue(maxsize=100)
         
@@ -43,10 +46,11 @@ class FrameReaderManagement:
         
         # Exemplo com RTSP (Poderia ser o ReadKafkaCommand)
         """video_command = ReadRTSPCommand(
-            source="examples/pessoas_rua_60fps.mp4", 
+            source="rtsp://admin:Aluno@00@10.145.80.52:554", #funciona com rtsp://admin:Aluno@00@10.145.80.52:554
             output_queue=self.raw_frames_queue,
             width=640,
             height=480
+        
         )
         
         self._reader_invoker = FrameReaderInvoker(
@@ -55,6 +59,11 @@ class FrameReaderManagement:
             name="VideoReaderInvoker"
         )"""
 
+        # Garantir que target_camera_id é sempre uma string (evita erros de tipagem)
+        _target_camera = getattr(self.config, "KAFKA_TARGET_CAMERA", None)
+        if _target_camera is None:
+            _target_camera = ""
+
         kafka_command = ReadKafkaCommand(
             output_queue=self.raw_frames_queue,
             bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
@@ -62,7 +71,7 @@ class FrameReaderManagement:
             group_id=self.config.KAFKA_GROUP_ID,
             width=self.config.PROCESSING_WIDTH,
             height=self.config.PROCESSING_HEIGHT,
-            target_camera_id=getattr(self.config, "KAFKA_TARGET_CAMERA", None)
+            target_camera_id=_target_camera
         )
 
         self._reader_invoker = FrameReaderInvoker(
@@ -74,46 +83,66 @@ class FrameReaderManagement:
         self._reader_invoker.start()
 
     def _main_routing_loop(self):
-        """
-        Lê a fila partilhada e distribui os frames para as threads 
-        de processamento corretas de forma dinâmica.
-        """
         logging.info("Router principal ativo. A aguardar frames...")
         
+        frames_exibidos = 0 # Contador para depuração
+
         while not self.stop_event.is_set():
             try:
-                # Tenta pegar um frame gerado pelos Comandos
-                cam_id, frame = self.raw_frames_queue.get(timeout=0.5)
+                # 1. DRENA TODOS os Frames Brutos disponíveis
+                while True:
+                    try:
+                        cam_id, frame = self.raw_frames_queue.get_nowait()
+                        
+                        # Provisionamento Dinâmico
+                        if cam_id not in self.camera_workers:
+                            logging.info(f"Nova câmara detetada: '{cam_id}'. A iniciar Worker...")
+                            
+                            # --- CORREÇÃO LINUX: FORÇAR CRIAÇÃO DA JANELA ---
+                            window_name = f"SmartBuilds - {cam_id}"
+                            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                            cv2.resizeWindow(window_name, self.config.PROCESSING_WIDTH, self.config.PROCESSING_HEIGHT)
+                            # ------------------------------------------------
+                            
+                            cam_queue = queue.Queue(maxsize=30)
+                            self.camera_queues[cam_id] = cam_queue
+                            
+                            worker = CameraWorker(
+                                cam_id=cam_id,
+                                input_queue=cam_queue,
+                                display_queue=self.display_queue,
+                                config=self.config,
+                                global_manager=self.global_id_manager,
+                                stop_event=self.stop_event
+                            )
+                            worker.start()
+                            self.camera_workers[cam_id] = worker
 
-                # Descoberta Dinâmica de Câmaras (Dynamic Provisioning)
-                if cam_id not in self.camera_workers:
-                    logging.info(f"Nova câmara detetada: '{cam_id}'. A iniciar Worker...")
-                    
-                    cam_queue = queue.Queue(maxsize=30)
-                    self.camera_queues[cam_id] = cam_queue
-                    
-                    worker = CameraWorker(
-                        cam_id=cam_id,
-                        input_queue=cam_queue,
-                        config=self.config,
-                        global_manager=self.global_id_manager,
-                        stop_event=self.stop_event
-                    )
-                    worker.start()
-                    self.camera_workers[cam_id] = worker
+                        self.camera_queues[cam_id].put_nowait(frame)
+                    except queue.Empty:
+                        break 
+                    except queue.Full:
+                        break 
 
-                # Envia o frame para a fila do Worker correspondente
-                try:
-                    self.camera_queues[cam_id].put_nowait(frame)
-                except queue.Full:
-                    pass
+                # 2. DRENA TODOS os Frames Processados disponíveis
+                while True:
+                    try:
+                        disp_cam_id, disp_frame = self.display_queue.get_nowait()
+                        cv2.imshow(f"SmartBuilds - {disp_cam_id}", disp_frame)
+                    except queue.Empty:
+                        break 
 
-            except queue.Empty:
-                pass
+                # 3. Processa eventos da interface gráfica
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    logging.info("Tecla 'q' pressionada. Encerrando...")
+                    self.stop_event.set()
+                    break
+
             except KeyboardInterrupt:
                 logging.info("Interrupção manual detetada (Ctrl+C). Iniciando encerramento...")
                 self.stop_event.set()
-                break # CORREÇÃO: Sai do loop imediatamente para ir para o _shutdown
+                break
 
     def _shutdown(self):
         logging.info("A iniciar rotina de encerramento seguro...")
@@ -137,7 +166,7 @@ class FrameReaderManagement:
         # 4. Destrói as janelas com segurança
         cv2.destroyAllWindows()
         # No macOS/Linux, por vezes é necessário este truque para forçar as janelas a fecharem
-        for i in range(4): 
-            cv2.waitKey(1)
+        """for i in range(4): 
+            cv2.waitKey(1)"""
             
         logging.info("Programa finalizado com sucesso.")

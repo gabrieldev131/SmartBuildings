@@ -5,6 +5,7 @@ import queue
 import threading
 import numpy as np
 from ultralytics import YOLO
+import torch
 
 # Importação do Deep SORT
 from deep_sort_realtime.deepsort_tracker import DeepSort
@@ -13,10 +14,11 @@ from core.StoppedStateTracker import StoppedStateTracker
 from ui.display import draw_person_annotation
 
 class CameraWorker(threading.Thread):
-    def __init__(self, cam_id: str, input_queue: queue.Queue, config, global_manager, stop_event: threading.Event):
+    def __init__(self, cam_id: str, input_queue: queue.Queue, display_queue: queue.Queue, config, global_manager, stop_event: threading.Event):
         super().__init__(daemon=True, name=f"Worker-{cam_id}")
         self.cam_id = cam_id
         self.input_queue = input_queue
+        self.display_queue = display_queue
         self.config = config
         self.global_manager = global_manager
         self.stop_event = stop_event
@@ -24,8 +26,9 @@ class CameraWorker(threading.Thread):
         self.local_to_global_map = {}
 
     def run(self):
+        torch.backends.cudnn.benchmark = True
         # YOLO apenas para deteção
-        model = YOLO(self.config.YOLO_MODEL_PATH, verbose=False)
+        model = YOLO(self.config.YOLO_MODEL_PATH, task='detect', verbose=False)
         state_tracker = StoppedStateTracker(self.config)
 
         # CORREÇÃO 1: Ajuste rigoroso da supressão de não-máximos (NMS)
@@ -49,6 +52,7 @@ class CameraWorker(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 frame = self.input_queue.get(timeout=1.0)
+                
             except queue.Empty:
                 continue
 
@@ -67,19 +71,26 @@ class CameraWorker(threading.Thread):
                 classes=[0], 
                 conf=0.50,       # Apenas deteções com mais de 50% de certeza
                 iou=0.45,        # Corta duplicações nativas do YOLO
-                verbose=False
+                verbose=False,
+                device=0,      # <-- FORÇA O DISPOSITIVO (Impede verificações de hardware a cada frame)
+                half=True,     # <-- FORÇA FP16 (Corta o tráfego no barramento PCIe pela metade)
+                stream=True    # <-- REDUZ OVERHEAD DE MEMÓRIA (Gera um generator em vez de uma lista pesada)
             )
             
             bbs = []
-            if results[0].boxes is not None:
-                for box in results[0].boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    conf = float(box.conf[0].cpu().numpy())
-                    cls = int(box.cls[0].cpu().numpy())
+            # Como stream=True retorna um generator, iteramos diretamente
+            for result in results:
+                if result.boxes is not None:
+                    # Mover os tensores para a CPU em lote usando numpy() de forma vetorizada
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    confs = result.boxes.conf.cpu().numpy()
+                    clss = result.boxes.cls.cpu().numpy()
                     
-                    w = x2 - x1
-                    h = y2 - y1
-                    bbs.append(([x1, y1, w, h], conf, cls))
+                    for i in range(len(boxes)):
+                        x1, y1, x2, y2 = boxes[i]
+                        w = x2 - x1
+                        h = y2 - y1
+                        bbs.append(([x1, y1, w, h], float(confs[i]), int(clss[i])))
             
             # O Deep SORT rastreia e extrai os vetores
             tracks = tracker.update_tracks(bbs, frame=frame)
@@ -154,9 +165,14 @@ class CameraWorker(threading.Thread):
             cv2.putText(frame, f"Fila: {q_size}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
             # -------------------------------------------------
 
-            cv2.imshow(f"Camera {self.cam_id}", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            try:
+                # Envia o frame final (com as caixas e IDs desenhados) para o router principal exibir
+                self.display_queue.put_nowait((self.cam_id, frame))
+            except queue.Full:
+                pass
+            #cv2.imshow(f"Camera {self.cam_id}", frame)
+            """if cv2.waitKey(1) & 0xFF == ord('q'):
                 self.stop_event.set()
-                break
+                break"""
 
         print(f"[{self.name}] Encerrado.")

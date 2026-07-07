@@ -87,7 +87,10 @@ class GlobalIdentityManager:
                 if time_lost > self.max_time_lost:
                     continue
 
-                appearance_dist = cosine(new_feature_vector, identity_obj.feature_vector)
+                dot_product = np.dot(new_feature_vector, identity_obj.feature_vector)
+                # Garante que imprecisões de ponto flutuante não gerem valores negativos
+                appearance_dist = max(0.0, 1.0 - dot_product) 
+
                 is_same_camera = (identity_obj.current_camera == cam_id)
                 
                 # =========================================================
@@ -95,7 +98,7 @@ class GlobalIdentityManager:
                 # =========================================================
                 if is_same_camera:
                     old_center = self._get_center(identity_obj.last_bbox)
-                    spatial_dist = np.linalg.norm(new_center - old_center)
+                    spatial_dist = np.sqrt((new_center[0] - old_center[0])**2 + (new_center[1] - old_center[1])**2)
                     
                     # Prevenção de Teletransporte local
                     if spatial_dist > self.max_spatial_distance and time_lost < 1.0:

@@ -18,27 +18,31 @@ class StoppedStateTracker:
             self.stopped_state[global_id] = False
             self.stopped_since[global_id] = current_time
 
-        self.position_history[global_id].append((current_time, center))
         history = self.position_history[global_id]
+        history.append((current_time, center))
+
+        # OTIMIZAÇÃO: Esvazia a ponta esquerda da fila (mais antiga) até sobrar apenas a janela de tempo válida
+        while len(history) > 0 and (current_time - history[0][0]) > self.config.STOPPED_SECONDS_THRESHOLD:
+            history.popleft()
 
         if len(history) < 2:
-            return False, 0.0
-
-        recent = [pt for pt in history if current_time - pt[0] <= self.config.STOPPED_SECONDS_THRESHOLD]
-        if len(recent) < 2:
             return self.stopped_state[global_id], 0.0
 
-        start_pos, end_pos = recent[0][1], recent[-1][1]
-        displacement = np.sqrt((end_pos[0] - start_pos[0])**2 + (end_pos[1] - start_pos[1])**2)
-
+        # OTIMIZAÇÃO: Agora basta comparar a ponta esquerda (mais velha válida) com a direita (atual)
+        start_pos = history[0][1]
+        end_pos = history[-1][1]
+        
+        # O cálculo euclidiano cru sem np.sqrt também poupa ciclos de CPU
+        squared_displacement = (end_pos[0] - start_pos[0])**2 + (end_pos[1] - start_pos[1])**2
         currently_stopped = self.stopped_state[global_id]
 
         if currently_stopped:
-            if displacement > self.config.MOVEMENT_BREAKOUT_THRESHOLD:
+            # Comparamos com o quadrado do limiar para evitar a raiz quadrada pesada
+            if squared_displacement > (self.config.MOVEMENT_BREAKOUT_THRESHOLD ** 2):
                 self.stopped_state[global_id] = False
                 self.stopped_since[global_id] = current_time
         else:
-            if displacement < self.config.STOPPED_PIXEL_THRESHOLD:
+            if squared_displacement < (self.config.STOPPED_PIXEL_THRESHOLD ** 2):
                 if (current_time - self.stopped_since[global_id]) >= self.config.STOPPED_SECONDS_THRESHOLD:
                     self.stopped_state[global_id] = True
             else:

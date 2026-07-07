@@ -209,6 +209,7 @@ __marimo__/
 # images
 capturas_mvc/
 dnn_model/
+models/
 *.png
 # DNN models
 *.pt
