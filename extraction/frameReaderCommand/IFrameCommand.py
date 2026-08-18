@@ -1,16 +1,17 @@
-# model/commands/IFrameCommand.py
+# extraction/frameReaderCommand/IFrameCommand.py
 from abc import ABC, abstractmethod
+from typing import Tuple, Any, Optional
 
 class IFrameCommand(ABC):
     """
     Interface base para o Padrão Command focado na extração de frames.
-    Encapsula a lógica específica de cada fonte de dados.
+    Agora adaptada para retorno síncrono.
     """
     
     @abstractmethod
-    def execute(self) -> None:
+    def execute(self) -> Optional[Tuple[str, Any]]:
         """
-        Executa um ciclo de leitura (um frame ou um batch) e enfileira o resultado.
+        Executa um ciclo de leitura e retorna (cam_id, frame) ou None se não houver frame.
         """
         pass
     

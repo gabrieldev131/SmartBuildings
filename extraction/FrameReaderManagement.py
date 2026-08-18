@@ -1,39 +1,29 @@
-# controller/app_controller.py
+# extraction/FrameReaderManagement.py
 import threading
-import queue
 import time
 import logging
 import cv2
 
-# Importação dos seus comandos (Ajuste os imports conforme a sua estrutura)
 from extraction.frameReaderCommand.ReadRTSPCommand import ReadRTSPCommand
 from extraction.frameReaderCommand.ReadKafkaCommand import ReadKafkaCommand
-from extraction.frameReaderCommand.FrameReaderInvoker import FrameReaderInvoker
 
 from core.GlobalIdentityManager import GlobalIdentityManager
 from vision.cameraWorker import CameraWorker
 
 class FrameReaderManagement:
     """
-    Orquestrador que liga o Padrão Command (Aquisição) ao Processamento (Workers).
+    Orquestrador único e sequencial para aquisição e processamento de frames.
     """
     def __init__(self, config):
         self.config = config
         self.stop_event = threading.Event()
         
-        # No __init__ do FrameReaderManagement
-        self.display_queue = queue.Queue(maxsize=100)
-
-        # Fila onde os Comandos colocam as imagens brutas
-        self.raw_frames_queue = queue.Queue(maxsize=100)
-        
-        # Dicionário de filas e workers por câmara
-        self.camera_queues = {}
+        # Dicionário de workers por câmara (sem filas atreladas)
         self.camera_workers = {}
         
         # Manager de Identidades Único
         self.global_id_manager = GlobalIdentityManager(config)
-        self._reader_invoker = None
+        self.video_command = None
 
     def run(self):
         logging.info("A iniciar o sistema...")
@@ -43,29 +33,16 @@ class FrameReaderManagement:
 
     def _start_frame_reader(self):
         """Inicializa a abstração de extração de frames (Command Pattern)."""
-        
-        # Exemplo com RTSP (Poderia ser o ReadKafkaCommand)
-        """video_command = ReadRTSPCommand(
-            source="rtsp://admin:Aluno@00@10.145.80.52:554", #funciona com rtsp://admin:Aluno@00@10.145.80.52:554
-            output_queue=self.raw_frames_queue,
+        self.video_command = ReadRTSPCommand(
+            source="rtsp://admin:Aluno@00@10.145.80.52:554",
             width=640,
             height=480
-        
         )
         
-        self._reader_invoker = FrameReaderInvoker(
-            command=video_command,
-            stop_event=self.stop_event,
-            name="VideoReaderInvoker"
-        )"""
-
-        # Garantir que target_camera_id é sempre uma string (evita erros de tipagem)
-        _target_camera = getattr(self.config, "KAFKA_TARGET_CAMERA", None)
-        if _target_camera is None:
-            _target_camera = ""
-
-        kafka_command = ReadKafkaCommand(
-            output_queue=self.raw_frames_queue,
+        # Exemplo Kafka (Comente o RTSP acima e descomente abaixo se for usar):
+        """
+        _target_camera = getattr(self.config, "KAFKA_TARGET_CAMERA", "")
+        self.video_command = ReadKafkaCommand(
             bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
             topic=self.config.KAFKA_TOPIC,
             group_id=self.config.KAFKA_GROUP_ID,
@@ -73,66 +50,55 @@ class FrameReaderManagement:
             height=self.config.PROCESSING_HEIGHT,
             target_camera_id=_target_camera
         )
-
-        self._reader_invoker = FrameReaderInvoker(
-            command=kafka_command,
-            stop_event=self.stop_event,
-            name="VideoReaderInvoker"
-        )
-
-        self._reader_invoker.start()
+        """
 
     def _main_routing_loop(self):
-        logging.info("Router principal ativo. A aguardar frames...")
-        
-        frames_exibidos = 0 # Contador para depuração
+        logging.info("Router principal ativo. Extração e processamento síncronos iniciados.")
 
         while not self.stop_event.is_set():
             try:
-                # 1. DRENA TODOS os Frames Brutos disponíveis
-                while True:
-                    try:
-                        cam_id, frame = self.raw_frames_queue.get_nowait()
+                if self.video_command is None:
+                    logging.warning("Leitor de vídeo não inicializado. A tentar inicializar...")
+                    self._start_frame_reader()
+
+                if self.video_command is None:
+                    time.sleep(0.1)
+                    continue
+
+                # 1. Extrai UM frame da fonte
+                result = self.video_command.execute()
+
+                if result:
+                    cam_id, frame = result
+                    
+                    # 2. Provisionamento Dinâmico (Instanciação Síncrona do Worker)
+                    if cam_id not in self.camera_workers:
+                        logging.info(f"Nova câmara detetada: '{cam_id}'. Inicializando Pipeline de Visão...")
                         
-                        # Provisionamento Dinâmico
-                        if cam_id not in self.camera_workers:
-                            logging.info(f"Nova câmara detetada: '{cam_id}'. A iniciar Worker...")
-                            
-                            # --- CORREÇÃO LINUX: FORÇAR CRIAÇÃO DA JANELA ---
-                            window_name = f"SmartBuilds - {cam_id}"
-                            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                            cv2.resizeWindow(window_name, self.config.PROCESSING_WIDTH, self.config.PROCESSING_HEIGHT)
-                            # ------------------------------------------------
-                            
-                            cam_queue = queue.Queue(maxsize=30)
-                            self.camera_queues[cam_id] = cam_queue
-                            
-                            worker = CameraWorker(
-                                cam_id=cam_id,
-                                input_queue=cam_queue,
-                                display_queue=self.display_queue,
-                                config=self.config,
-                                global_manager=self.global_id_manager,
-                                stop_event=self.stop_event
-                            )
-                            worker.start()
-                            self.camera_workers[cam_id] = worker
+                        # --- CORREÇÃO LINUX: FORÇAR CRIAÇÃO DA JANELA ---
+                        window_name = f"SmartBuilds - {cam_id}"
+                        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                        cv2.resizeWindow(window_name, self.config.PROCESSING_WIDTH, self.config.PROCESSING_HEIGHT)
+                        # ------------------------------------------------
+                        
+                        worker = CameraWorker(
+                            cam_id=cam_id,
+                            config=self.config,
+                            global_manager=self.global_id_manager
+                        )
+                        self.camera_workers[cam_id] = worker
 
-                        self.camera_queues[cam_id].put_nowait(frame)
-                    except queue.Empty:
-                        break 
-                    except queue.Full:
-                        break 
+                    # 3. Executa o processamento do frame de imediato (YOLO/Tracking)
+                    # NOTA: Assumindo que você criará um método "process_frame" no CameraWorker
+                    disp_frame = self.camera_workers[cam_id].process_frame(frame)
+                    
+                    # 4. Exibe o frame processado ou original na tela
+                    if disp_frame is not None:
+                        cv2.imshow(f"SmartBuilds - {cam_id}", disp_frame)
+                    else:
+                        cv2.imshow(f"SmartBuilds - {cam_id}", frame)
 
-                # 2. DRENA TODOS os Frames Processados disponíveis
-                while True:
-                    try:
-                        disp_cam_id, disp_frame = self.display_queue.get_nowait()
-                        cv2.imshow(f"SmartBuilds - {disp_cam_id}", disp_frame)
-                    except queue.Empty:
-                        break 
-
-                # 3. Processa eventos da interface gráfica
+                # 5. Processa eventos da interface gráfica
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     logging.info("Tecla 'q' pressionada. Encerrando...")
@@ -148,25 +114,21 @@ class FrameReaderManagement:
         logging.info("A iniciar rotina de encerramento seguro...")
         self.stop_event.set()
 
-        # 1. Aguarda que a extração de frames pare
-        if self._reader_invoker:
-            logging.info("A parar captura de vídeo...")
-            self._reader_invoker.join(timeout=3)
+        # 1. Limpa o Command de captura
+        if self.video_command:
+            logging.info("A libertar recursos de vídeo/rede...")
+            self.video_command.cleanup()
 
-        # 2. CORREÇÃO: Aguarda que TODOS os workers das câmaras terminem
-        # Isso impede que o OpenCV bloqueie ou "morra" de repente, deixando janelas presas.
+        # 2. Limpa os pipelines de visão se necessário
         for cam_id, worker in self.camera_workers.items():
-            logging.info(f"A aguardar encerramento seguro da câmara '{cam_id}'...")
-            worker.join(timeout=2)
+            if hasattr(worker, 'cleanup'):
+                worker.cleanup()
 
-        # 3. Exporta as estatísticas agora que tudo parou
+        # 3. Exporta as estatísticas
         logging.info("A exportar dados para CSV...")
         self.global_id_manager.export_data_to_csv("tracking_data_final.csv")
         
         # 4. Destrói as janelas com segurança
         cv2.destroyAllWindows()
-        # No macOS/Linux, por vezes é necessário este truque para forçar as janelas a fecharem
-        """for i in range(4): 
-            cv2.waitKey(1)"""
             
         logging.info("Programa finalizado com sucesso.")

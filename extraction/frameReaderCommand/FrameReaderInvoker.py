@@ -1,4 +1,4 @@
-# model/invokers/FrameReaderInvoker.py
+# extraction/frameReaderCommand/FrameReaderInvoker.py
 import threading
 import logging
 from extraction.frameReaderCommand.IFrameCommand import IFrameCommand
