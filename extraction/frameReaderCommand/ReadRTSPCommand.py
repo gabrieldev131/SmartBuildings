@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Tuple, Optional, Any
 from extraction.frameReaderCommand.IFrameCommand import IFrameCommand
+import os
 
 class ReadRTSPCommand(IFrameCommand):
     """
@@ -18,11 +19,23 @@ class ReadRTSPCommand(IFrameCommand):
 
     def _connect(self):
         logging.info(f"Tentando conectar a {self.source}...")
-        self.cap = cv2.VideoCapture(self.source)
+        
+        # Limita buffers e reduz a latência da CPU.
+        # "threads;1" limita as threads internas de decodificação do FFMPEG:
+        # sem isso, o próprio decoder pode criar várias threads (uma por
+        # núcleo) só para decodificar o vídeo, mais uma fonte de threads
+        # nativas competindo pela CPU com o YOLO/OpenCV/BLAS.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|threads;1"
+        
+        # Força explicitamente a utilização do backend FFMPEG
+        self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+        
+        # Diz ao OpenCV para não guardar histórico de frames
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+        
         if not self.cap.isOpened():
             logging.error(f"Erro ao abrir fonte de vídeo: {self.source}")
             self.cap = None
-
     def execute(self) -> Optional[Tuple[str, Any]]:
         if self.cap is None or not self.cap.isOpened():
             self._connect()

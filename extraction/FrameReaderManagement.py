@@ -33,12 +33,17 @@ class FrameReaderManagement:
 
     def _start_frame_reader(self):
         """Inicializa a abstração de extração de frames (Command Pattern)."""
-        self.video_command = ReadRTSPCommand(
+        """self.video_command = ReadRTSPCommand(
             source="rtsp://admin:Aluno@00@10.145.80.52:554",
             width=640,
             height=480
+        )"""
+
+        self.video_command = ReadRTSPCommand(
+            source="models/pessoas.mp4",
+            width=640,
+            height=480
         )
-        
         # Exemplo Kafka (Comente o RTSP acima e descomente abaixo se for usar):
         """
         _target_camera = getattr(self.config, "KAFKA_TARGET_CAMERA", "")
