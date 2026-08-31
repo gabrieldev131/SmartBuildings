@@ -70,4 +70,4 @@ def extract_color_histogram_rich(frame: np.ndarray, box: list) -> np.ndarray:
 # Mantido por compatibilidade com qualquer código antigo que ainda importe
 # o nome original -- aponta para a versão rica (a de melhor qualidade),
 # nunca para a barata, para não reintroduzir silenciosamente o mesmo bug.
-extract_color_histogram = extract_color_histogram_rich
+#extract_color_histogram = extract_color_histogram_rich
