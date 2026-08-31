@@ -1,139 +1,96 @@
 # extraction/FrameReaderManagement.py
-import threading
-import time
+import multiprocessing as mp
 import logging
-import cv2
 
-from extraction.frameReaderCommand.ReadRTSPCommand import ReadRTSPCommand
-from extraction.frameReaderCommand.ReadKafkaCommand import ReadKafkaCommand
+from core.IdentityManagerServer import IdentityManagerServer
+from extraction.frameReaderCommand.CommandFactories import RTSPCommandFactory
+from extraction.CameraProcess import run_camera_process
 
-from core.GlobalIdentityManager import GlobalIdentityManager
-from vision.cameraWorker import CameraWorker
 
 class FrameReaderManagement:
     """
-    Orquestrador único e sequencial para aquisição e processamento de frames.
+    Orquestrador único do sistema: sobe o processo servidor de identidades
+    globais (IdentityManagerServer) e um processo dedicado por câmara
+    (CameraProcess.run_camera_process), aguarda o encerramento e cuida do
+    shutdown (export do CSV, etc).
+
+    Este é o ÚNICO lugar que precisa mudar para adicionar, remover ou
+    reconfigurar uma câmara -- ver _camera_factories(). main.py fica
+    responsável só pelo que é específico do PROCESSO PRINCIPAL (limites de
+    threads nativas, método de criação de processos) e chama .run() aqui,
+    igual fazia antes com a versão baseada em threads.
     """
     def __init__(self, config):
         self.config = config
-        self.stop_event = threading.Event()
-        
-        # Dicionário de workers por câmara (sem filas atreladas)
-        self.camera_workers = {}
-        
-        # Manager de Identidades Único
-        self.global_id_manager = GlobalIdentityManager(config)
-        self.video_command = None
+        self.stop_event = mp.Event()
+        self.processes: list[mp.Process] = []
+        self.manager = None
+        self.global_manager_proxy = None
+
+    def _camera_factories(self):
+        """
+        Uma factory por câmara. Para adicionar mais câmaras, inclua mais
+        entradas aqui -- cada uma ganha o seu próprio processo, mas todas
+        recebem o MESMO global_manager_proxy, então uma pessoa vista em
+        câmaras diferentes recebe o mesmo global_id.
+
+        IMPORTANTE: cada entrada precisa ser uma instância de factory
+        picklable (classe com __call__, ver CommandFactories.py), NUNCA
+        uma lambda -- multiprocessing com "spawn" precisa serializar tudo
+        que é passado para Process(...).
+        """
+        return [
+            RTSPCommandFactory(source="models/pessoas.mp4", width=640, height=480),
+            # Segunda câmara real, por exemplo:
+            # RTSPCommandFactory(source="rtsp://admin:senha@10.145.80.52:554", width=640, height=480),
+        ]
 
     def run(self):
         logging.info("A iniciar o sistema...")
-        self._start_frame_reader()
-        self._main_routing_loop()
+        self._start_identity_server()
+        self._start_camera_processes()
+        self._wait_for_processes()
         self._shutdown()
 
-    def _start_frame_reader(self):
-        """Inicializa a abstração de extração de frames (Command Pattern)."""
-        """self.video_command = ReadRTSPCommand(
-            source="rtsp://admin:Aluno@00@10.145.80.52:554",
-            width=640,
-            height=480
-        )"""
+    def _start_identity_server(self):
+        """Sobe o processo dedicado que hospeda a única instância real do GlobalIdentityManager."""
+        self.manager = IdentityManagerServer(authkey=b"smartbuilds-reid")
+        self.manager.start()
+        self.global_manager_proxy = self.manager.GlobalIdentityManager(self.config)
+        logging.info("Servidor de identidades globais iniciado.")
 
-        self.video_command = ReadRTSPCommand(
-            source="models/pessoas.mp4",
-            width=640,
-            height=480
-        )
-        # Exemplo Kafka (Comente o RTSP acima e descomente abaixo se for usar):
-        """
-        _target_camera = getattr(self.config, "KAFKA_TARGET_CAMERA", "")
-        self.video_command = ReadKafkaCommand(
-            bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
-            topic=self.config.KAFKA_TOPIC,
-            group_id=self.config.KAFKA_GROUP_ID,
-            width=self.config.PROCESSING_WIDTH,
-            height=self.config.PROCESSING_HEIGHT,
-            target_camera_id=_target_camera
-        )
-        """
+    def _start_camera_processes(self):
+        for idx, factory in enumerate(self._camera_factories()):
+            proc_name = f"CameraProc-{idx}"
+            p = mp.Process(
+                target=run_camera_process,
+                args=(factory, self.config, self.global_manager_proxy, self.stop_event, proc_name),
+                name=proc_name,
+            )
+            p.start()
+            self.processes.append(p)
+            logging.info(f"Processo '{proc_name}' iniciado (pid={p.pid}).")
 
-    def _main_routing_loop(self):
-        logging.info("Router principal ativo. Extração e processamento síncronos iniciados.")
-
-        while not self.stop_event.is_set():
-            try:
-                if self.video_command is None:
-                    logging.warning("Leitor de vídeo não inicializado. A tentar inicializar...")
-                    self._start_frame_reader()
-
-                if self.video_command is None:
-                    time.sleep(0.1)
-                    continue
-
-                # 1. Extrai UM frame da fonte
-                result = self.video_command.execute()
-
-                if result:
-                    cam_id, frame = result
-                    
-                    # 2. Provisionamento Dinâmico (Instanciação Síncrona do Worker)
-                    if cam_id not in self.camera_workers:
-                        logging.info(f"Nova câmara detetada: '{cam_id}'. Inicializando Pipeline de Visão...")
-                        
-                        # --- CORREÇÃO LINUX: FORÇAR CRIAÇÃO DA JANELA ---
-                        window_name = f"SmartBuilds - {cam_id}"
-                        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                        cv2.resizeWindow(window_name, self.config.PROCESSING_WIDTH, self.config.PROCESSING_HEIGHT)
-                        # ------------------------------------------------
-                        
-                        worker = CameraWorker(
-                            cam_id=cam_id,
-                            config=self.config,
-                            global_manager=self.global_id_manager
-                        )
-                        self.camera_workers[cam_id] = worker
-
-                    # 3. Executa o processamento do frame de imediato (YOLO/Tracking)
-                    # NOTA: Assumindo que você criará um método "process_frame" no CameraWorker
-                    disp_frame = self.camera_workers[cam_id].process_frame(frame)
-                    
-                    # 4. Exibe o frame processado ou original na tela
-                    if disp_frame is not None:
-                        cv2.imshow(f"SmartBuilds - {cam_id}", disp_frame)
-                    else:
-                        cv2.imshow(f"SmartBuilds - {cam_id}", frame)
-
-                # 5. Processa eventos da interface gráfica
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    logging.info("Tecla 'q' pressionada. Encerrando...")
-                    self.stop_event.set()
-                    break
-
-            except KeyboardInterrupt:
-                logging.info("Interrupção manual detetada (Ctrl+C). Iniciando encerramento...")
-                self.stop_event.set()
-                break
+    def _wait_for_processes(self):
+        try:
+            while any(p.is_alive() for p in self.processes):
+                for p in self.processes:
+                    p.join(timeout=0.5)
+        except KeyboardInterrupt:
+            logging.info("Interrupção manual (Ctrl+C). Encerrando todos os processos...")
 
     def _shutdown(self):
         logging.info("A iniciar rotina de encerramento seguro...")
         self.stop_event.set()
 
-        # 1. Limpa o Command de captura
-        if self.video_command:
-            logging.info("A libertar recursos de vídeo/rede...")
-            self.video_command.cleanup()
+        for p in self.processes:
+            p.join(timeout=5.0)
+            if p.is_alive():
+                logging.warning(f"Processo '{p.name}' não encerrou a tempo, finalizando à força.")
+                p.terminate()
 
-        # 2. Limpa os pipelines de visão se necessário
-        for cam_id, worker in self.camera_workers.items():
-            if hasattr(worker, 'cleanup'):
-                worker.cleanup()
-
-        # 3. Exporta as estatísticas
         logging.info("A exportar dados para CSV...")
-        self.global_id_manager.export_data_to_csv("tracking_data_final.csv")
-        
-        # 4. Destrói as janelas com segurança
-        cv2.destroyAllWindows()
-            
+        self.global_manager_proxy.export_data_to_csv("tracking_data_final.csv")
+
+        self.manager.shutdown()
         logging.info("Programa finalizado com sucesso.")
