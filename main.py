@@ -14,7 +14,7 @@
 # e queda de FPS ao longo do tempo (exatamente o sintoma relatado).
 import os
 
-_CPU_THREADS = "2"  # ajuste conforme os núcleos livres da sua máquina
+_CPU_THREADS = "8"  # ajuste conforme os núcleos livres da sua máquina
 os.environ["OMP_NUM_THREADS"] = _CPU_THREADS
 os.environ["MKL_NUM_THREADS"] = _CPU_THREADS
 os.environ["OPENBLAS_NUM_THREADS"] = _CPU_THREADS
@@ -30,8 +30,8 @@ cv2.setNumThreads(2)
 import torch
 # Threads de CPU do PyTorch (usadas em pré/pós-processamento do YOLO,
 # NMS, etc). Não precisa ser igual ao nº de núcleos: o gargalo é a GPU.
-torch.set_num_threads(2)
-torch.set_num_interop_threads(1)
+torch.set_num_threads(4)
+torch.set_num_interop_threads(2)
 # cudnn.benchmark: setado UMA vez para todo o processo (antes era setado
 # dentro do __init__ de cada CameraWorker, redundante se houver >1 câmara).
 torch.backends.cudnn.benchmark = True
