@@ -2,8 +2,11 @@
 import multiprocessing as mp
 import logging
 
+from core.GlobalIdentityManager import GlobalIdentityManager
 from core.IdentityManagerServer import IdentityManagerServer
-from extraction.frameReaderCommand.CommandFactories import RTSPCommandFactory
+from extraction.frameReaderCommand import ReadKafkaCommand
+from extraction.frameReaderCommand.CommandFactories import RTSPCommandFactory, KafkaCommandFactory
+
 from extraction.CameraProcess import run_camera_process
 
 
@@ -39,10 +42,19 @@ class FrameReaderManagement:
         uma lambda -- multiprocessing com "spawn" precisa serializar tudo
         que é passado para Process(...).
         """
+        _target_camera = self.config.KAFKA_TARGET_CAMERA
         return [
-            RTSPCommandFactory(source="models/pessoas.mp4", width=640, height=480),
+            #RTSPCommandFactory(source="models/pessoas.mp4", width=640, height=480),
             # Segunda câmara real, por exemplo:
-            # RTSPCommandFactory(source="rtsp://admin:senha@10.145.80.52:554", width=640, height=480),
+            #RTSPCommandFactory(source="rtsp://admin:Aluno@00@10.145.80.52:554", width=640, height=480),
+            KafkaCommandFactory(
+            bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
+            topic=self.config.KAFKA_TOPIC,
+            group_id=self.config.KAFKA_GROUP_ID,
+            width=self.config.PROCESSING_WIDTH,
+            height=self.config.PROCESSING_HEIGHT,
+            target_camera_id=_target_camera
+            )
         ]
 
     def run(self):

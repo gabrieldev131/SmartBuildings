@@ -57,34 +57,42 @@ def run_camera_process(command_factory, config, global_manager_proxy, stop_event
     # (isso agora é o processo que resolve), só sobrepor a ESPERA de I/O
     # (rede/decodificação) desta câmera com o processamento dela mesma --
     # e I/O libera o GIL, então uma thread local ainda ajuda.
+    # extraction/CameraProcess.py
+# (Mantenha seus imports e o início de run_camera_process...)
+
     reader = FrameReaderInvoker(cam_key=proc_name, command=command, stop_event=local_stop, name=f"{proc_name}-reader")
     reader.start()
 
-    worker = None
-    window_name = None
-
+    # Dicionários para manter controle dinâmico do que for descoberto
+    workers = {}
+    
     try:
         while not local_stop.is_set():
-            result = reader.get_latest()
-            if result is None:
+            frames_dict = reader.get_latest()
+            if frames_dict is None:
                 time.sleep(0.001)
                 continue
 
-            cam_id, frame = result
+            # Itera sobre todas as câmeras descobertas neste ciclo
+            for cam_id, frame in frames_dict.items():
+                
+                # Se for a primeira vez que vemos essa câmera, instanciamos a interface
+                if cam_id not in workers:
+                    logging.info(f"Nova câmera detectada automaticamente: '{cam_id}'...")
+                    window_name = f"SmartBuilds - {cam_id}"
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow(window_name, config.PROCESSING_WIDTH, config.PROCESSING_HEIGHT)
+                    
+                    workers[cam_id] = CameraWorker(cam_id=cam_id, config=config, global_manager=global_manager_proxy)
 
-            if worker is None:
-                logging.info(f"Inicializando pipeline de visão para '{cam_id}'...")
-                window_name = f"SmartBuilds - {cam_id}"
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(window_name, config.PROCESSING_WIDTH, config.PROCESSING_HEIGHT)
-                # O worker recebe o PROXY -- ele chama os mesmos métodos de
-                # sempre (get_or_create_global_id, update_existing_identity),
-                # sem saber que agora eles viajam até outro processo.
-                worker = CameraWorker(cam_id=cam_id, config=config, global_manager=global_manager_proxy)
+                # Processa o frame com o worker correspondente
+                worker = workers[cam_id]
+                disp_frame = worker.process_frame(frame)
+                
+                # Exibe na janela dedicada desta câmera
+                cv2.imshow(f"SmartBuilds - {cam_id}", disp_frame if disp_frame is not None else frame)
 
-            disp_frame = worker.process_frame(frame)
-            cv2.imshow(window_name, disp_frame if disp_frame is not None else frame)
-
+            # Só chamamos waitKey uma vez por ciclo para não travar
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 stop_event.set()
@@ -98,8 +106,10 @@ def run_camera_process(command_factory, config, global_manager_proxy, stop_event
     finally:
         local_stop.set()
         reader.join(timeout=2.0)
-        if worker is not None:
+        
+        # Limpeza dinâmica de todas as câmeras descobertas
+        for cam_id, worker in workers.items():
             worker.cleanup()
-        if window_name is not None:
-            cv2.destroyWindow(window_name)
+            cv2.destroyWindow(f"SmartBuilds - {cam_id}")
+            
         logging.info(f"[{proc_name}] Processo encerrado.")

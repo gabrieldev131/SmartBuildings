@@ -30,7 +30,7 @@ class FrameReaderInvoker(threading.Thread):
         self.command = command
         self.stop_event = stop_event
         self._lock = threading.Lock()
-        self._latest = None  # (cam_id, frame) ou None
+        self._latest_frames = {}
 
     def run(self):
         logging.info(f"[{self.name}] Iniciando loop de captura para '{self.cam_key}'...")
@@ -38,19 +38,23 @@ class FrameReaderInvoker(threading.Thread):
         while not self.stop_event.is_set():
             result = self.command.execute()
             if result is not None:
+                cam_id, frame = result
                 with self._lock:
-                    self._latest = result
+                    self._latest_frames[cam_id] = frame
 
         logging.info(f"[{self.name}] Thread encerrada. Executando limpeza...")
         self.command.cleanup()
 
     def get_latest(self):
         """
-        Retorna o frame mais recente disponível e o consome (evita processar
-        o mesmo frame duas vezes se a captura ainda não tiver produzido um novo).
-        Retorna None se nenhum frame novo estiver disponível desde a última chamada.
+        Retorna o dicionário de frames mais recentes e o consome.
+        Retorna None se nenhum novo frame estiver disponível.
         """
         with self._lock:
-            result = self._latest
-            self._latest = None
+            if not self._latest_frames:
+                return None
+            
+            # Copiamos o estado atual e limpamos para forçar a busca de frames novos
+            result = self._latest_frames.copy()
+            self._latest_frames.clear()
             return result

@@ -86,7 +86,7 @@ class CameraWorker:
             iou=0.45,
             verbose=False,
             device=0,
-            quantize=32,
+            half=True,
             stream=True
         )
 
@@ -177,6 +177,13 @@ class CameraWorker:
         cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
         return frame
+
+    def normalize_feature(feature_vector: np.ndarray) -> np.ndarray:
+        """Garante que o vetor de embeddings tenha norma L2 = 1.0 para cálculo de cosseno."""
+        norm = np.linalg.norm(feature_vector)
+        if norm == 0:
+            return feature_vector
+        return (feature_vector / norm).astype(np.float32)
 
     def cleanup(self):
         print(f"[Worker-{self.cam_id}] Recursos libertados.")
