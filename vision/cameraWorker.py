@@ -51,10 +51,10 @@ class CameraWorker:
         self.state_tracker = StoppedStateTracker(self.config)
 
         self.tracker = DeepSort(
-            max_age=300,
-            n_init=6,
+            max_age=60,
+            n_init=3,
             nms_max_overlap=0.35,
-            max_cosine_distance=0.2,
+            max_cosine_distance=0.45,
             embedder=None,
         )
 
@@ -115,8 +115,17 @@ class CameraWorker:
         # interno do DeepSORT dentro da mesma câmara.
         tracks = self.tracker.update_tracks(bbs, embeds=det_features_fast, others=det_features_fast)
 
-        active_local_ids = set()
+        # 1. Identifica quais IDs locais do DeepSORT realmente estão válidos neste exato frame
+        current_active_locals = {track.track_id for track in tracks if track.is_confirmed() and track.time_since_update == 0}
+
+        # 2. Limpa o mapa de referências ANTES de buscar novos IDs globais
+        lost_locals = [lid for lid in self.local_to_global_map if lid not in current_active_locals]
+        for lid in lost_locals:
+            del self.local_to_global_map[lid]
+
+        # 3. Constrói a lista de IDs globais bloqueados usando apenas as pessoas realmente ativas
         active_global_ids = set(self.local_to_global_map.values())
+        active_local_ids = current_active_locals
 
         do_feature_update = (self.frame_counter % self.feature_update_interval == 0)
 
@@ -168,10 +177,6 @@ class CameraWorker:
 
             is_stopped, elapsed = self.state_tracker.update_and_evaluate(global_id, box, current_time)
             draw_person_annotation(frame, box, global_id, is_stopped, elapsed, self.config)
-
-        lost_locals = [lid for lid in self.local_to_global_map if lid not in active_local_ids]
-        for lid in lost_locals:
-            del self.local_to_global_map[lid]
 
         cv2.rectangle(frame, (5, 5), (160, 40), (0, 0, 0), -1)
         cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)

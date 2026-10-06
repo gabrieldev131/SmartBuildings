@@ -10,31 +10,15 @@ from core.GlobalIdentity import GlobalIdentity
 from core.CameraClusterManager import CameraClusterManager
 
 class GlobalIdentityManager:
-    """
-    Estado compartilhado entre TODAS as câmaras/threads de processamento.
-    É essa mesma instância (mesmo objeto em memória) que é passada para
-    cada CameraWorker -- é isso que garante que uma pessoa vista em
-    câmaras diferentes recebe o mesmo global_id.
-
-    Como mais de uma thread pode chamar get_or_create_global_id /
-    update_existing_identity ao mesmo tempo (uma thread de processamento
-    por câmara, por exemplo), todo acesso ao dicionário self.identities
-    (leitura+escrita, "check-then-act") precisa ser atômico. self._lock
-    garante isso: cada chamada pública que lê e depois decide escrever
-    é protegida do início ao fim, então duas câmaras nunca criam dois
-    IDs novos para a mesma pessoa numa corrida, nem corrompem o dicionário
-    sendo alterado por duas threads ao mesmo tempo.
-    """
     def __init__(self, config=None):
         self.config = config
         
-        self.intra_camera_threshold = getattr(config, 'SIMILARITY_THRESHOLD', 0.25) 
-        self.inter_camera_threshold = getattr(config, 'INTER_CAMERA_THRESHOLD', 0.40)
+        # Limiares de distancia coseno (0.0 = identico, 1.0 = completamente diferente)
+        self.intra_camera_threshold = getattr(config, 'SIMILARITY_THRESHOLD', 0.30) 
+        self.inter_camera_threshold = getattr(config, 'INTER_CAMERA_THRESHOLD', 0.42)
+        self.max_time_lost = getattr(config, 'MAX_TIME_LOST', 12.0)
         
-        self.max_time_lost = getattr(config, 'MAX_TIME_LOST', 10.0)
-        
-        # Guardamos o quadrado do limite para evitar raízes quadradas depois
-        max_dist = getattr(config, 'MAX_SPATIAL_DISTANCE', 150)
+        max_dist = getattr(config, 'MAX_SPATIAL_DISTANCE', 180)
         self.max_spatial_distance_sq = max_dist ** 2
         
         self.switch_cooldown = getattr(config, 'CAMERA_SWITCH_COOLDOWN', 2.0)
@@ -46,12 +30,6 @@ class GlobalIdentityManager:
         
         self.identities: dict[int, GlobalIdentity] = {}  
         self.next_global_id = 1
-
-        # Lock único protegendo self.identities / self.next_global_id.
-        # Reentrante (RLock) porque os métodos públicos chamam métodos
-        # internos (_check_and_update_clusters, _cleanup_old_identities)
-        # que também podem precisar do lock -- com RLock a mesma thread
-        # pode adquiri-lo de novo sem se travar.
         self._lock = threading.RLock()
 
     def _get_center(self, bbox: list) -> np.ndarray:
@@ -81,10 +59,12 @@ class GlobalIdentityManager:
 
     def update_existing_identity(self, global_id: int, new_feature_vector, bbox: list, cam_id: str, current_time: float):
         with self._lock:
+            is_edge = self._is_near_edge(bbox)
             if global_id in self.identities:
                 identity = self.identities[global_id]
                 self._check_and_update_clusters(identity, cam_id, current_time)
-                identity.update(new_feature_vector, bbox, cam_id, current_time, switch_cooldown=self.switch_cooldown)
+                feat_to_update = None if is_edge else new_feature_vector
+                identity.update(feat_to_update, bbox, cam_id, current_time, switch_cooldown=self.switch_cooldown)
 
     def get_or_create_global_id(self, new_feature_vector, bbox: list, cam_id: str, current_time: float, active_global_ids: set = None):
         if active_global_ids is None:
@@ -92,65 +72,53 @@ class GlobalIdentityManager:
             
         best_match_id = None
         best_distance = float('inf')
-        new_center = self._get_center(bbox)
 
         with self._lock:
             self._cleanup_old_identities(current_time)
 
             for global_id, identity_obj in self.identities.items():
-
+                
+                # TRAVA CRÍTICA: Impede categoricamente que 2 tracks ativos na mesma câmera 
+                # peguem o mesmo ID global, causando duplicações instantâneas.
                 if global_id in active_global_ids:
                     continue
 
                 time_lost = current_time - identity_obj.last_seen
-
                 if time_lost > self.max_time_lost:
                     continue
 
-                dot_product = np.dot(new_feature_vector, identity_obj.feature_vector)
-                appearance_dist = max(0.0, 1.0 - dot_product)
-
+                # Compara similaridade usando a Galeria (calculada no match_score)
+                appearance_dist = identity_obj.match_score(new_feature_vector)
+                
                 is_same_camera = (identity_obj.current_camera == cam_id)
 
                 if is_same_camera:
-                    old_center = self._get_center(identity_obj.last_bbox)
-
-                    # CÁLCULO OTIMIZADO: Distância ao quadrado (sem np.sqrt)
-                    spatial_dist_sq = (new_center[0] - old_center[0])**2 + (new_center[1] - old_center[1])**2
-
-                    # Prevenção de Teletransporte comparando com o limite ao quadrado
-                    if spatial_dist_sq > self.max_spatial_distance_sq and time_lost < 1.0:
-                        continue
-
-                    exited_scene = self._is_near_edge(identity_obj.last_bbox)
-                    is_completely_different = appearance_dist > 0.50
-
-                    if not exited_scene and not is_completely_different:
-                        # 80^2 = 6400 | 150^2 = 22500
-                        if spatial_dist_sq < 6400 and time_lost < 2.0:
-                            appearance_dist *= 0.1
-                        elif spatial_dist_sq < 22500 and time_lost < 4.0:
-                            appearance_dist *= 0.4
-
+                    # Sem checagem de distância em pixels (spatial_dist_sq).
+                    # Se a pessoa sumiu e apareceu do outro lado da sala (ou câmera travou), 
+                    # a aparência ainda deve garantir o Re-ID.
                     if appearance_dist < best_distance and appearance_dist < self.intra_camera_threshold:
                         best_distance = appearance_dist
                         best_match_id = global_id
-
                 else:
+                    # Limiar para transição inter-câmera
                     if appearance_dist < best_distance and appearance_dist < self.inter_camera_threshold:
                         best_distance = appearance_dist
                         best_match_id = global_id
 
+            is_edge = self._is_near_edge(bbox)
             if best_match_id is not None:
                 identity = self.identities[best_match_id]
                 self._check_and_update_clusters(identity, cam_id, current_time)
 
-                mudou_de_camera = identity.update(new_feature_vector, bbox, cam_id, current_time, self.switch_cooldown)
+                feat_to_update = None if is_edge else new_feature_vector
+                mudou_de_camera = identity.update(feat_to_update, bbox, cam_id, current_time, self.switch_cooldown)
                 if mudou_de_camera:
-                    logging.info(f"Re-ID Evento: ID {best_match_id} moveu-se permanentemente para a {cam_id} (Distância: {best_distance:.2f})")
+                    logging.info(f"Re-ID Evento: ID {best_match_id} moveu-se para a câmara '{cam_id}' (Distância: {best_distance:.3f})")
 
                 return best_match_id
-
+            if is_edge:
+                pass
+            # Instancia nova pessoa apenas se esgotadas todas as buscas seguras
             new_id = self.next_global_id
             nova_identidade = GlobalIdentity(
                 global_id=new_id,
@@ -162,7 +130,7 @@ class GlobalIdentityManager:
 
             self.identities[new_id] = nova_identidade
             self.next_global_id += 1
-            logging.info(f"Re-ID Evento: Nova pessoa -> ID {new_id} na {cam_id}")
+            logging.info(f"Re-ID Evento: Nova pessoa detectada -> Criado ID {new_id} na câmara '{cam_id}'")
             return new_id
 
     def _aggregate_history_by_clusters(self, global_id: int, raw_history: list) -> list[dict]:
@@ -225,7 +193,6 @@ class GlobalIdentityManager:
         return formatted
 
     def export_data_to_csv(self, filename="tracking_data.csv"):
-
         with self._lock:
             if not self.identities:
                 return

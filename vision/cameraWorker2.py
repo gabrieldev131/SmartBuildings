@@ -7,7 +7,6 @@ import numpy as np
 from ultralytics import YOLO
 import torch
 
-# 1. DEEPSORT REMOVIDO: Adeus rede neural secundária!
 # from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from core.StoppedStateTracker import StoppedStateTracker

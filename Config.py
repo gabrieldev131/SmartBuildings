@@ -9,8 +9,8 @@ class Config:
     MOVEMENT_BREAKOUT_THRESHOLD = 30
     
     # === LIMIARES DE IDENTIDADE BIFURCADOS ===
-    SIMILARITY_THRESHOLD = 0.20           # Rigoroso: Para rastreio dentro da MESMA câmara
-    INTER_CAMERA_THRESHOLD = 0.35         # Permissivo: Para compensar mudanças de iluminação ao mudar de câmara
+    SIMILARITY_THRESHOLD = 0.38           # Rigoroso: Para rastreio dentro da MESMA câmara
+    INTER_CAMERA_THRESHOLD = 0.45         # Permissivo: Para compensar mudanças de iluminação ao mudar de câmara
     
     MAX_SPATIAL_DISTANCE = 150    
     MAX_TIME_LOST = 10.0                 # Aumentado para 10s para permitir que a pessoa ande entre corredores sem câmara

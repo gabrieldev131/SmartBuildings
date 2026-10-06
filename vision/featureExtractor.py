@@ -1,73 +1,49 @@
 # vision/featureExtractor.py
 import cv2
+import torch
+import torchvision.transforms as T
+import torchvision.models as models
 import numpy as np
 
+# Inicialização da rede neural para Re-ID (desativa a cabeça de classificação)
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+_model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+_model.classifier = torch.nn.Identity()  # Remove a camada final para obter embeddings (576D)
+_model.to(_device).eval()
 
-def _crop_person(frame: np.ndarray, box: list):
+_transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((256, 128)),  # Proporção padrão de Re-ID de pedestres (H x W)
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+def _crop_person(frame: np.ndarray, box: list) -> np.ndarray:
     x1, y1, x2, y2 = map(int, box)
+    h_img, w_img = frame.shape[:2]
+    
+    x1_c = max(0, x1)
+    y1_c = max(0, y1)
+    x2_c = min(w_img, x2)
+    y2_c = min(h_img, y2)
+    
+    return frame[y1_c:y2_c, x1_c:x2_c]
 
-    h, w = y2 - y1, x2 - x1
-    y1_inner = max(0, int(y1 + h * 0.10))
-    y2_inner = min(frame.shape[0], int(y2 - h * 0.10))
-    x1_inner = max(0, int(x1 + w * 0.25))
-    x2_inner = min(frame.shape[1], int(x2 - w * 0.25))
-
-    crop = frame[y1_inner:y2_inner, x1_inner:x2_inner]
-
-    if crop.size == 0:
-        y1, y2 = max(0, y1), min(frame.shape[0], y2)
-        x1, x2 = max(0, x1), min(frame.shape[1], x2)
-        crop = frame[y1:y2, x1:x2]
-
-    return crop
-
-
-def _histogram(crop: np.ndarray, crop_size, bins, empty_len) -> np.ndarray:
-    if crop.size == 0:
-        return np.zeros(empty_len)
-
-    resized = cv2.resize(crop, crop_size, interpolation=cv2.INTER_AREA)
-    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, list(bins), [0, 180, 0, 256, 0, 256])
-    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-    return hist.flatten()
-
-
-# ---------------------------------------------------------------------------
-# VERSÃO BARATA: usada TODO frame, para TODA deteção -- alimenta o custo de
-# aparência interno do DeepSORT (embeds/others). Precisa ser rápida, não
-# precisa ser super discriminativa: o DeepSORT já tem posição/IOU/Kalman
-# para ajudar na associação quadro-a-quadro dentro da MESMA câmara.
-# ---------------------------------------------------------------------------
-_FAST_CROP_SIZE = (48, 96)
-_FAST_BINS = (8, 4, 4)      # 128 valores
-_FAST_LEN = 8 * 4 * 4
-
-def extract_color_histogram_fast(frame: np.ndarray, box: list) -> np.ndarray:
+@torch.no_grad()
+def extract_deep_reid_feature(frame: np.ndarray, box: list) -> np.ndarray:
     crop = _crop_person(frame, box)
-    return _histogram(crop, _FAST_CROP_SIZE, _FAST_BINS, _FAST_LEN)
+    if crop.size == 0 or crop.shape[0] < 15 or crop.shape[1] < 15:
+        return np.zeros(576, dtype=np.float32)
 
+    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    tensor = _transform(crop_rgb).unsqueeze(0).to(_device)
 
-# ---------------------------------------------------------------------------
-# VERSÃO RICA: usada só nos momentos que realmente importam para o Re-ID
-# global entre câmaras -- quando uma pessoa nova aparece numa câmara (decide
-# se é alguém já visto antes) e nas atualizações periódicas (throttled) do
-# vetor EMA guardado no GlobalIdentityManager. Isso acontece raramente por
-# pessoa (não a cada frame), então pode pagar o custo de mais bins/mais
-# resolução sem pesar na CPU de forma perceptível.
-# ---------------------------------------------------------------------------
-_RICH_CROP_SIZE = (96, 192)
-_RICH_BINS = (16, 8, 8)     # 1024 valores -- qualidade original
-_RICH_LEN = 16 * 8 * 8
+    feat = _model(tensor).squeeze(0).cpu().numpy()
+    norm = np.linalg.norm(feat)
+    
+    return (feat / norm if norm > 0 else feat).astype(np.float32)
 
-def extract_color_histogram_rich(frame: np.ndarray, box: list) -> np.ndarray:
-    crop = _crop_person(frame, box)
-    return _histogram(crop, _RICH_CROP_SIZE, _RICH_BINS, _RICH_LEN)
-
-
-# Mantido por compatibilidade com qualquer código antigo que ainda importe
-# o nome original -- aponta para a versão rica (a de melhor qualidade),
-# nunca para a barata, para não reintroduzir silenciosamente o mesmo bug.
-extract_color_histogram = extract_color_histogram_rich
+# Mapeia as chamadas usadas no worker para o extrator profundo
+extract_color_histogram = extract_deep_reid_feature
+extract_color_histogram_fast = extract_deep_reid_feature
+extract_color_histogram_rich = extract_deep_reid_feature
