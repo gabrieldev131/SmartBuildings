@@ -1,194 +1,158 @@
 # vision/cameraWorker.py
-import cv2
+"""
+CameraWorker: Per-camera tracking, global identity resolution, behavioral state evaluation,
+and visual annotation.
+Supports both:
+1) Batched Pipeline Mode via `process_detections(...)` (where GPU detection & Re-ID are
+   executed across all cameras simultaneously by BatchInferenceEngine).
+2) Standalone Mode via `process_frame(...)` (for single-camera or multiprocess callers).
+"""
 import time
+from typing import Optional
+import cv2
 import numpy as np
-from ultralytics import YOLO
-
-# Importação do Deep SORT
-from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from core.StoppedStateTracker import StoppedStateTracker
-from ui.display import draw_person_annotation
-from vision.featureExtractor import extract_color_histogram_fast, extract_color_histogram_rich
+from ui.display import draw_person_annotation, draw_camera_hud
+from vision.VectorizedDeepSort import VectorizedDeepSort
 
 
 class CameraWorker:
     """
-    Worker responsável por executar inferência (YOLO) e rastreio (DeepSORT).
-
-    ESTRATÉGIA DE FEATURES EM DUAS CAMADAS (importante para o Re-ID entre
-    câmaras funcionar corretamente):
-
-    1) BARATA (extract_color_histogram_fast) -- calculada para TODA deteção,
-       TODO frame. Alimenta só o custo de aparência interno do DeepSORT
-       (embeds/others), usado para associar caixas dentro da MESMA câmara
-       quadro-a-quadro. Não precisa ser muito discriminativa: o Kalman
-       filter + IOU do próprio DeepSORT já ajudam bastante aqui.
-
-    2) RICA (extract_color_histogram_rich) -- calculada só nos dois
-       momentos que REALMENTE decidem a identidade global de uma pessoa:
-         a) quando um local_id novo aparece (é aí que perguntamos ao
-            GlobalIdentityManager "quem é essa pessoa?" -- decisão
-            cross-camera);
-         b) na atualização periódica (throttled, a cada N frames) do vetor
-            EMA guardado na identidade global.
-       Como isso acontece raramente por pessoa (não a cada frame), pagar o
-       custo de mais bins/mais resolução aqui não pesa na CPU, mas devolve
-       a precisão de reconhecimento que se perde usando só a versão barata.
-
-    Usar a versão barata nesses dois pontos foi o que reintroduziu o bug de
-    "mesma pessoa, ID diferente em cada câmara" -- a versão rica é o que
-    resolve isso mantendo o ganho de performance.
+    Worker responsible for associating detections into continuous local tracks (VectorizedDeepSort),
+    resolving cross-camera identities (GlobalIdentityManager), evaluating stopped behavior
+    (StoppedStateTracker), and annotating output frames.
     """
-    def __init__(self, cam_id: str, config, global_manager):
+
+    def __init__(self, cam_id: str, config, global_manager, inference_engine=None):
         self.cam_id = cam_id
         self.config = config
         self.global_manager = global_manager
+        self._inference_engine = inference_engine
 
-        self.local_to_global_map = {}
-
-        self.model = YOLO(self.config.YOLO_MODEL_PATH, task='detect', verbose=False)
+        self.local_to_global_map: dict[int, int] = {}
         self.state_tracker = StoppedStateTracker(self.config)
 
-        self.tracker = DeepSort(
-            max_age=60,
-            n_init=3,
-            nms_max_overlap=0.35,
-            max_cosine_distance=0.45,
-            embedder=None,
+        self.tracker = VectorizedDeepSort(
+            max_age=getattr(config, "DEEPSORT_MAX_AGE", 60),
+            n_init=getattr(config, "DEEPSORT_N_INIT", 3),
+            max_iou_distance=getattr(config, "DEEPSORT_MAX_IOU_DISTANCE", 0.70),
+            max_cosine_distance=getattr(config, "DEEPSORT_MAX_COSINE_DISTANCE", 0.35),
+            nn_budget=getattr(config, "DEEPSORT_NN_BUDGET", 25),
+            conf_high=getattr(config, "YOLO_CONF_HIGH", 0.42),
+            conf_low=getattr(config, "YOLO_CONF_LOW", 0.25),
         )
 
-        self.feature_update_interval = getattr(config, 'FEATURE_UPDATE_INTERVAL', 3)
+        self.max_coast_frames = getattr(config, "DEEPSORT_MAX_COAST_FRAMES", 2)
+        self.feature_update_interval = getattr(config, "FEATURE_UPDATE_INTERVAL", 3)
         self.frame_counter = 0
 
-        self.prev_time = time.time()
+        self.prev_time = time.perf_counter()
         self.fps = 0.0
 
-        # Prova de que todas as câmaras compartilham a MESMA instância do
-        # GlobalIdentityManager (memória compartilhada entre threads/câmaras).
-        # Se rodar com várias câmaras, compare esse id() nos logs -- deve
-        # ser IDÊNTICO em todas elas.
-        print(f"[Worker-{self.cam_id}] Inicializado. GlobalIdentityManager compartilhado id={id(self.global_manager)}")
-
-    def process_frame(self, frame):
-        current_time = time.time()
-        self.frame_counter += 1
-
-        frame_time = current_time - self.prev_time
-        current_fps = 1.0 / frame_time if frame_time > 0 else 0.0
-        self.fps = 0.9 * self.fps + 0.1 * current_fps if self.fps > 0 else current_fps
-        self.prev_time = current_time
-
-        results = self.model.predict(
-            frame,
-            classes=[0],
-            conf=0.50,
-            iou=0.45,
-            verbose=False,
-            device=0,
-            half=True,
-            stream=True
+        print(
+            f"[Worker-{self.cam_id}] Inicializado. "
+            f"GlobalIdentityManager compartilhado id={id(self.global_manager)}"
         )
 
-        bbs = []
-        boxes_xyxy = []      # guardamos as caixas originais para recalcular a feature rica depois
-        det_features_fast = []
+    def _get_or_init_engine(self):
+        if self._inference_engine is None:
+            from vision.BatchInferenceEngine import BatchInferenceEngine
+            self._inference_engine = BatchInferenceEngine(self.config)
+        return self._inference_engine
 
-        for result in results:
-            if result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes.xyxy.cpu().numpy()
-                confs = result.boxes.conf.cpu().numpy()
-                clss = result.boxes.cls.cpu().numpy()
+    def process_detections(
+        self,
+        frame: np.ndarray,
+        boxes_xyxy: np.ndarray,
+        confs: np.ndarray,
+        feats: np.ndarray,
+        current_time: Optional[float] = None,
+        override_fps: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Process pre-extracted GPU detections and Re-ID embeddings for this camera.
+        """
+        now_perf = time.perf_counter()
+        if current_time is None:
+            current_time = time.time()
+        self.frame_counter += 1
 
-                for (x1, y1, x2, y2), c, cls_id in zip(boxes, confs, clss):
-                    w = x2 - x1
-                    h = y2 - y1
-                    box_xyxy = [float(x1), float(y1), float(x2), float(y2)]
-                    bbs.append(([float(x1), float(y1), float(w), float(h)], float(c), int(cls_id)))
-                    boxes_xyxy.append(box_xyxy)
+        if override_fps is not None:
+            self.fps = override_fps
+        else:
+            dt = now_perf - self.prev_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                self.fps = 0.90 * self.fps + 0.10 * inst_fps if self.fps > 0 else inst_fps
+        self.prev_time = now_perf
 
-                    raw_feature = extract_color_histogram_fast(frame, box_xyxy)
-                    norm = np.linalg.norm(raw_feature)
-                    det_features_fast.append(raw_feature / norm if norm > 0 else raw_feature)
+        tracks = self.tracker.update(boxes_xyxy, confs, feats)
 
-        # embeds/others = versão barata: só para o custo de associação
-        # interno do DeepSORT dentro da mesma câmara.
-        tracks = self.tracker.update_tracks(bbs, embeds=det_features_fast, others=det_features_fast)
+        # Keep local_to_global_map entries for all non-deleted tracks so 1-2 frame
+        # detector dropouts do NOT wipe the Global ID or trigger redundant Re-ID queries!
+        alive_local_ids = {track.track_id for track in tracks if not track.is_deleted()}
+        for lid in list(self.local_to_global_map.keys()):
+            if lid not in alive_local_ids:
+                del self.local_to_global_map[lid]
 
-        # 1. Identifica quais IDs locais do DeepSORT realmente estão válidos neste exato frame
-        current_active_locals = {track.track_id for track in tracks if track.is_confirmed() and track.time_since_update == 0}
-
-        # 2. Limpa o mapa de referências ANTES de buscar novos IDs globais
-        lost_locals = [lid for lid in self.local_to_global_map if lid not in current_active_locals]
-        for lid in lost_locals:
-            del self.local_to_global_map[lid]
-
-        # 3. Constrói a lista de IDs globais bloqueados usando apenas as pessoas realmente ativas
         active_global_ids = set(self.local_to_global_map.values())
-        active_local_ids = current_active_locals
-
         do_feature_update = (self.frame_counter % self.feature_update_interval == 0)
 
+        active_count = 0
         for track in tracks:
-            if not track.is_confirmed() or track.time_since_update > 0:
+            if not track.is_confirmed() or track.time_since_update > self.max_coast_frames:
                 continue
 
+            active_count += 1
             local_id = track.track_id
-            active_local_ids.add(local_id)
-
-            ltrb = track.to_ltrb()
-            box = [ltrb[0], ltrb[1], ltrb[2], ltrb[3]]
+            box = track.to_ltrb()
+            ema_feature = track.get_feature()
 
             if local_id not in self.local_to_global_map:
-                # Momento crítico (a): decisão cross-camera. Sempre com a
-                # versão RICA, calculada agora, na hora, sobre esta caixa.
-                rich_feature = extract_color_histogram_rich(frame, box)
-                norm = np.linalg.norm(rich_feature)
-                rich_feature = rich_feature / norm if norm > 0 else rich_feature
-
                 global_id = self.global_manager.get_or_create_global_id(
-                    new_feature_vector=rich_feature,
+                    new_feature_vector=ema_feature,
                     bbox=box,
                     cam_id=self.cam_id,
                     current_time=current_time,
-                    active_global_ids=active_global_ids
+                    active_global_ids=active_global_ids,
                 )
                 self.local_to_global_map[local_id] = global_id
                 active_global_ids.add(global_id)
             else:
                 global_id = self.local_to_global_map[local_id]
-
-                sent_feature = None
-                if do_feature_update:
-                    # Momento (b): atualização periódica do EMA global,
-                    # também com a versão RICA -- mas só a cada N frames,
-                    # então o custo extra é desprezível.
-                    rich_feature = extract_color_histogram_rich(frame, box)
-                    norm = np.linalg.norm(rich_feature)
-                    sent_feature = rich_feature / norm if norm > 0 else rich_feature
-
-                self.global_manager.update_existing_identity(
-                    global_id=global_id,
-                    new_feature_vector=sent_feature,
-                    bbox=box,
-                    cam_id=self.cam_id,
-                    current_time=current_time
-                )
+                # Only communicate with GlobalIdentityManager on the throttled interval
+                if do_feature_update and track.time_since_update == 0:
+                    self.global_manager.update_existing_identity(
+                        global_id=global_id,
+                        new_feature_vector=ema_feature,
+                        bbox=box,
+                        cam_id=self.cam_id,
+                        current_time=current_time,
+                    )
 
             is_stopped, elapsed = self.state_tracker.update_and_evaluate(global_id, box, current_time)
             draw_person_annotation(frame, box, global_id, is_stopped, elapsed, self.config)
 
-        cv2.rectangle(frame, (5, 5), (160, 40), (0, 0, 0), -1)
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-
+        draw_camera_hud(frame, self.cam_id, self.fps, active_count)
         return frame
 
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Standalone single-camera entrypoint: runs GPU detection + Re-ID extraction and tracks.
+        """
+        engine = self._get_or_init_engine()
+        batch_out = engine.infer_batch([frame])
+        boxes_xyxy, confs, feats = batch_out[0]
+        return self.process_detections(frame, boxes_xyxy, confs, feats)
+
+    @staticmethod
     def normalize_feature(feature_vector: np.ndarray) -> np.ndarray:
-        """Garante que o vetor de embeddings tenha norma L2 = 1.0 para cálculo de cosseno."""
-        norm = np.linalg.norm(feature_vector)
-        if norm == 0:
+        """Ensure L2 norm = 1.0 for cosine similarity calculations."""
+        norm = float(np.linalg.norm(feature_vector))
+        if norm <= 1e-6:
             return feature_vector
         return (feature_vector / norm).astype(np.float32)
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         print(f"[Worker-{self.cam_id}] Recursos libertados.")

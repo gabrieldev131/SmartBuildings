@@ -1,48 +1,35 @@
 # extraction/CameraProcess.py
-import time
 import logging
-import threading
 import multiprocessing
-import cv2
+import threading
+import time
 
 from core.runtime_setup import apply as apply_runtime_setup
 from extraction.frameReaderCommand.FrameReaderInvoker import FrameReaderInvoker
+from ui.display import MultiCameraDisplay
 from vision.cameraWorker import CameraWorker
 
 
-def run_camera_process(command_factory, config, global_manager_proxy, stop_event: multiprocessing.Event, proc_name: str):
+def run_camera_process(
+    command_factory,
+    config,
+    global_manager_proxy,
+    stop_event: multiprocessing.Event,
+    proc_name: str,
+) -> None:
     """
-    Executado inteiramente DENTRO de um processo dedicado a uma câmera
-    (chamado via multiprocessing.Process(target=run_camera_process, ...)).
-
-    command_factory: função SEM argumentos que cria o IFrameCommand desta
-    câmara (ex.: `lambda: ReadRTSPCommand(...)`). Precisa ser uma factory,
-    e não a instância já pronta, por duas razões:
-      1) objetos com sockets/handles de vídeo abertos (cv2.VideoCapture,
-         consumidor Kafka) geralmente não sobrevivem a ser transferidos
-         para outro processo;
-      2) com CUDA, o comando é inofensivo, mas o hábito de só construir
-         recursos de I/O DEPOIS de já estar no processo definitivo evita
-         uma classe inteira de bugs de processo/fork.
-
-    global_manager_proxy: proxy do GlobalIdentityManager (ver
-    core/IdentityManagerServer.py). As chamadas de método daqui viajam até
-    o processo que guarda o estado de verdade -- é isso que garante que
-    esta câmara e todas as outras concordam sobre quem é quem.
+    Worker entrypoint for legacy multiprocess mode (1 OS process per camera source).
+    Uses FrameReaderInvoker for asynchronous I/O, CameraWorker for GPU inference + tracking,
+    and MultiCameraDisplay for decoupled GUI presentation.
     """
-    # Cada processo tem seu próprio interpretador: as threads nativas de
-    # torch/cv2/BLAS precisam ser limitadas de novo, aqui dentro.
     apply_runtime_setup()
 
     logging.basicConfig(
         level=logging.INFO,
-        format=f'%(asctime)s - [{proc_name}/%(threadName)s] - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
+        format=f"%(asctime)s - [{proc_name}/%(threadName)s] - %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
     )
 
-    # Ponte: o stop_event é do multiprocessing (compartilhado entre
-    # processos); o FrameReaderInvoker espera um threading.Event (local a
-    # este processo). Uma thread fininha replica um sinal no outro.
     local_stop = threading.Event()
 
     def _bridge_stop():
@@ -52,20 +39,17 @@ def run_camera_process(command_factory, config, global_manager_proxy, stop_event
     threading.Thread(target=_bridge_stop, daemon=True, name=f"{proc_name}-stop-bridge").start()
 
     command = command_factory()
-    # Dentro do processo, ainda vale a pena ter uma thread só de captura:
-    # aqui não estamos mais tentando paralelizar CPU-bound entre câmaras
-    # (isso agora é o processo que resolve), só sobrepor a ESPERA de I/O
-    # (rede/decodificação) desta câmera com o processamento dela mesma --
-    # e I/O libera o GIL, então uma thread local ainda ajuda.
-    # extraction/CameraProcess.py
-# (Mantenha seus imports e o início de run_camera_process...)
-
-    reader = FrameReaderInvoker(cam_key=proc_name, command=command, stop_event=local_stop, name=f"{proc_name}-reader")
+    reader = FrameReaderInvoker(
+        cam_key=proc_name,
+        command=command,
+        stop_event=local_stop,
+        name=f"{proc_name}-reader",
+    )
     reader.start()
 
-    # Dicionários para manter controle dinâmico do que for descoberto
-    workers = {}
-    
+    display = MultiCameraDisplay(config)
+    workers: dict[str, CameraWorker] = {}
+
     try:
         while not local_stop.is_set():
             frames_dict = reader.get_latest()
@@ -73,28 +57,21 @@ def run_camera_process(command_factory, config, global_manager_proxy, stop_event
                 time.sleep(0.001)
                 continue
 
-            # Itera sobre todas as câmeras descobertas neste ciclo
+            rendered_frames = {}
             for cam_id, frame in frames_dict.items():
-                
-                # Se for a primeira vez que vemos essa câmera, instanciamos a interface
                 if cam_id not in workers:
                     logging.info(f"Nova câmera detectada automaticamente: '{cam_id}'...")
-                    window_name = f"SmartBuilds - {cam_id}"
-                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(window_name, config.PROCESSING_WIDTH, config.PROCESSING_HEIGHT)
-                    
-                    workers[cam_id] = CameraWorker(cam_id=cam_id, config=config, global_manager=global_manager_proxy)
+                    workers[cam_id] = CameraWorker(
+                        cam_id=cam_id,
+                        config=config,
+                        global_manager=global_manager_proxy,
+                    )
 
-                # Processa o frame com o worker correspondente
                 worker = workers[cam_id]
                 disp_frame = worker.process_frame(frame)
-                
-                # Exibe na janela dedicada desta câmera
-                cv2.imshow(f"SmartBuilds - {cam_id}", disp_frame if disp_frame is not None else frame)
+                rendered_frames[cam_id] = disp_frame if disp_frame is not None else frame
 
-            # Só chamamos waitKey uma vez por ciclo para não travar
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if not display.render(rendered_frames):
                 stop_event.set()
                 local_stop.set()
                 break
@@ -106,10 +83,7 @@ def run_camera_process(command_factory, config, global_manager_proxy, stop_event
     finally:
         local_stop.set()
         reader.join(timeout=2.0)
-        
-        # Limpeza dinâmica de todas as câmeras descobertas
-        for cam_id, worker in workers.items():
+        for worker in workers.values():
             worker.cleanup()
-            cv2.destroyWindow(f"SmartBuilds - {cam_id}")
-            
+        display.cleanup()
         logging.info(f"[{proc_name}] Processo encerrado.")
