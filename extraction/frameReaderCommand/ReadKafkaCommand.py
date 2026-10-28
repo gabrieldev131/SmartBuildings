@@ -85,9 +85,9 @@ class ReadKafkaCommand(IFrameCommand):
                     low, high = self._consumer.get_watermark_offsets(
                         TopicPartition(self.topic, pid), timeout=1.5
                     )
-                    # Start up to 16 messages before high watermark to immediately pick up
+                    # Start up to 32 messages before high watermark to immediately pick up
                     # the latest compacted frame per camera key without replaying old history
-                    start_off = max(low, high - 16) if high > low else OFFSET_END
+                    start_off = max(low, high - 32) if high > low else OFFSET_END
                 except Exception:
                     start_off = OFFSET_END
                 tps.append(TopicPartition(self.topic, pid, start_off))
@@ -108,10 +108,15 @@ class ReadKafkaCommand(IFrameCommand):
             time.sleep(0.02)
             return {}
 
-        # Drain up to 32 queued messages and keep only the newest JPEG payload per camera key
-        msgs = self._consumer.consume(num_messages=32, timeout=0.015)
+        # Drain queued messages and keep only the newest JPEG payload per camera key
+        msgs = self._consumer.consume(num_messages=64, timeout=0.005)
         if not msgs:
             return {}
+        while True:
+            more = self._consumer.consume(num_messages=64, timeout=0.0)
+            if not more:
+                break
+            msgs.extend(more)
 
         latest_bytes_by_cam: dict[str, bytes] = {}
         for msg in msgs:

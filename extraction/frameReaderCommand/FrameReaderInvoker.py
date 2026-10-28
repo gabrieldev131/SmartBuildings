@@ -67,6 +67,19 @@ class FrameReaderInvoker(threading.Thread):
             self._latest_frames.clear()
             return result
 
+    def get_batch_state(self) -> tuple[Optional[dict[str, np.ndarray]], set[str]]:
+        """
+        Return (all_cached_frames_copy, newly_updated_cam_ids).
+        Ensures every active camera is included in every GPU batch while tracking which
+        cameras received a fresh frame from the stream since the previous call.
+        """
+        with self._lock:
+            if not self._cached_frames:
+                return None, set()
+            new_cams = set(self._latest_frames.keys())
+            self._latest_frames.clear()
+            return {cid: frm.copy() for cid, frm in self._cached_frames.items()}, new_cams
+
     def get_latest_with_fallback(self) -> tuple[Optional[dict[str, np.ndarray]], bool]:
         """
         Return (frames_dict, is_new). If a new frame arrived, consumes it and returns (frames, True).

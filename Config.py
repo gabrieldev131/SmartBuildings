@@ -20,15 +20,15 @@ class Config:
 
     # === YOLO DETECTION PARAMETERS ===
     YOLO_MODEL_PATH = "models/yolo26n.pt"
-    YOLO_CONF_HIGH = 0.42          # High-confidence threshold for track creation & appearance updates
-    YOLO_CONF_LOW = 0.25           # Low-confidence threshold for 2nd-stage occlusion recovery (ByteTrack-style)
+    YOLO_CONF_HIGH = 0.34          # High-confidence threshold for track creation & appearance updates
+    YOLO_CONF_LOW = 0.22           # Low-confidence threshold for 2nd-stage occlusion recovery (ByteTrack-style)
     YOLO_IOU_THRESHOLD = 0.50      # Intra-class NMS IoU threshold to prevent duplicate boxes on one person
 
     # Geometric bounding-box validation (filters false positives such as furniture/reflections)
     MIN_BOX_WIDTH = 12
     MIN_BOX_HEIGHT = 24
-    MIN_ASPECT_RATIO = 0.18        # min (width / height)
-    MAX_ASPECT_RATIO = 0.95        # max (width / height)
+    MIN_ASPECT_RATIO = 0.12        # min (width / height)
+    MAX_ASPECT_RATIO = 3.50        # max (width / height) - supports close-up/seated/upper-body views
 
     # === DEEPSORT TRACKING PARAMETERS ===
     DEEPSORT_MAX_AGE = 60          # Max frames a track survives occlusion (1.0s at 60 FPS)
@@ -57,7 +57,7 @@ class Config:
 
     # === UI & PRESENTATION ===
     DISPLAY_ENABLED = True
-    DISPLAY_GRID_VIEW = True              # True = single unified multi-camera dashboard; False = window per camera
+    DISPLAY_GRID_VIEW = False             # False = dedicated window/tab per camera; True = single unified grid
     DISPLAY_MAX_FPS = 60                  # Throttles GUI redraws to 60 Hz so X11 never stalls GPU inference
     COLOR_STOPPED = (0, 0, 255)
     COLOR_MOVING = (0, 255, 0)

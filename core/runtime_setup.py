@@ -12,6 +12,7 @@ os.environ.setdefault("MKL_NUM_THREADS", _CPU_THREADS)
 os.environ.setdefault("OPENBLAS_NUM_THREADS", _CPU_THREADS)
 os.environ.setdefault("NUMEXPR_NUM_THREADS", _CPU_THREADS)
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _CPU_THREADS)
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 
 def apply():

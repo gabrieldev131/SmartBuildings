@@ -108,14 +108,15 @@ class FrameReaderManagement:
         # Wait briefly for initial frames from active cameras
         self._wait_for_initial_frames(timeout=3.0)
 
-        prev_batch_state = None  # Holds (cam_ids, frames_list, det_results, batch_timestamp)
+        prev_batch_state = None  # Holds (cam_ids, frames_list, det_results, batch_timestamp, new_cams)
         step_idx = 0
 
         def _process_and_render(batch_state) -> bool:
-            p_cam_ids, p_frames, p_det_results, p_ts = batch_state
+            p_cam_ids, p_frames, p_det_results, p_ts, p_new_cams = batch_state
             rendered_dict = {}
             for c_idx, cid in enumerate(p_cam_ids):
-                if cid not in workers:
+                is_first = cid not in workers
+                if is_first:
                     logging.info(f"Nova câmera ativa no pipeline: '{cid}'")
                     workers[cid] = CameraWorker(
                         cam_id=cid,
@@ -130,6 +131,7 @@ class FrameReaderManagement:
                     confs=confs,
                     feats=feats,
                     current_time=p_ts,
+                    is_new_frame=(is_first or (cid in p_new_cams)),
                 )
                 rendered_dict[cid] = out_frame
 
@@ -140,9 +142,8 @@ class FrameReaderManagement:
 
         try:
             while not self.local_stop.is_set():
-                cam_ids, frames_list = self._collect_batch_frames()
+                cam_ids, frames_list, new_cams = self._collect_batch_frames()
                 if not frames_list:
-                    # Flush any staged GPU batch immediately so 30 FPS Kafka/RTSP streams never wait
                     if prev_batch_state is not None:
                         if not _process_and_render(prev_batch_state):
                             break
@@ -166,7 +167,7 @@ class FrameReaderManagement:
 
                 # 3. Synchronize GPU stream for Batch t and stage its results for next iteration's CPU step
                 det_results = engine.synchronize_and_filter(curr_slot, curr_buf)
-                prev_batch_state = (cam_ids, frames_list, det_results, now_wall)
+                prev_batch_state = (cam_ids, frames_list, det_results, now_wall, new_cams)
                 step_idx += 1
 
         except KeyboardInterrupt:
@@ -185,25 +186,36 @@ class FrameReaderManagement:
 
     def _wait_for_initial_frames(self, timeout: float = 3.0) -> None:
         deadline = time.perf_counter() + timeout
+        expected = max(len(self.readers), getattr(self.config, "KAFKA_EXPECTED_CAMERAS", 2))
+        first_ready_ts = None
         while time.perf_counter() < deadline:
-            ready = sum(1 for r in self.readers if r._cached_frames)
-            if ready == len(self.readers) or ready > 0:
+            total_cams = sum(len(r._cached_frames) for r in self.readers)
+            if total_cams >= expected:
                 break
-            time.sleep(0.02)
+            if total_cams > 0:
+                if first_ready_ts is None:
+                    first_ready_ts = time.perf_counter()
+                elif (time.perf_counter() - first_ready_ts) >= 0.40:
+                    break
+            time.sleep(0.01)
 
-    def _collect_batch_frames(self) -> tuple[list[str], list]:
-        cam_ids = []
-        frames_list = []
+    def _collect_batch_frames(self) -> tuple[list[str], list, set[str]]:
+        frames_by_cam = {}
+        new_cams: set[str] = set()
 
         for r in self.readers:
-            frames_dict = r.get_latest()
-            if not frames_dict:
+            cached_dict, r_new_cams = r.get_batch_state()
+            if not cached_dict:
                 continue
-            for cid, frm in frames_dict.items():
-                cam_ids.append(cid)
-                frames_list.append(frm)
+            frames_by_cam.update(cached_dict)
+            new_cams.update(r_new_cams)
 
-        return cam_ids, frames_list
+        if not frames_by_cam:
+            return [], [], set()
+
+        cam_ids = sorted(frames_by_cam.keys())
+        frames_list = [frames_by_cam[cid] for cid in cam_ids]
+        return cam_ids, frames_list, new_cams
 
     # =========================================================================
     # MODE 2: LEGACY MULTIPROCESS MODE (1 OS Process Per Camera)

@@ -39,8 +39,8 @@ class CameraWorker:
             max_iou_distance=getattr(config, "DEEPSORT_MAX_IOU_DISTANCE", 0.70),
             max_cosine_distance=getattr(config, "DEEPSORT_MAX_COSINE_DISTANCE", 0.35),
             nn_budget=getattr(config, "DEEPSORT_NN_BUDGET", 25),
-            conf_high=getattr(config, "YOLO_CONF_HIGH", 0.42),
-            conf_low=getattr(config, "YOLO_CONF_LOW", 0.25),
+            conf_high=getattr(config, "YOLO_CONF_HIGH", 0.34),
+            conf_low=getattr(config, "YOLO_CONF_LOW", 0.22),
         )
 
         self.max_coast_frames = getattr(config, "DEEPSORT_MAX_COAST_FRAMES", 2)
@@ -69,14 +69,17 @@ class CameraWorker:
         feats: np.ndarray,
         current_time: Optional[float] = None,
         override_fps: Optional[float] = None,
+        is_new_frame: bool = True,
     ) -> np.ndarray:
         """
         Process pre-extracted GPU detections and Re-ID embeddings for this camera.
+        When `is_new_frame` is False (cached frame from an asynchronous stream running slower than
+        the GPU batch loop), preserves the Kalman filter state while updating real-time loitering
+        timers, annotations, and HUD throughput metrics.
         """
         now_perf = time.perf_counter()
         if current_time is None:
             current_time = time.time()
-        self.frame_counter += 1
 
         if override_fps is not None:
             self.fps = override_fps
@@ -87,7 +90,11 @@ class CameraWorker:
                 self.fps = 0.90 * self.fps + 0.10 * inst_fps if self.fps > 0 else inst_fps
         self.prev_time = now_perf
 
-        tracks = self.tracker.update(boxes_xyxy, confs, feats)
+        if is_new_frame:
+            self.frame_counter += 1
+            tracks = self.tracker.update(boxes_xyxy, confs, feats)
+        else:
+            tracks = self.tracker.tracks
 
         # Keep local_to_global_map entries for all non-deleted tracks so 1-2 frame
         # detector dropouts do NOT wipe the Global ID or trigger redundant Re-ID queries!
@@ -97,7 +104,7 @@ class CameraWorker:
                 del self.local_to_global_map[lid]
 
         active_global_ids = set(self.local_to_global_map.values())
-        do_feature_update = (self.frame_counter % self.feature_update_interval == 0)
+        do_feature_update = is_new_frame and (self.frame_counter % self.feature_update_interval == 0)
 
         active_count = 0
         for track in tracks:

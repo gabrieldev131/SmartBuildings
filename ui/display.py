@@ -78,7 +78,7 @@ class MultiCameraDisplay:
     def __init__(self, config):
         self.config = config
         self.enabled = getattr(config, "DISPLAY_ENABLED", True)
-        self.grid_view = getattr(config, "DISPLAY_GRID_VIEW", True)
+        self.grid_view = getattr(config, "DISPLAY_GRID_VIEW", False)
         max_fps = getattr(config, "DISPLAY_MAX_FPS", 60)
         self.min_render_interval = 1.0 / max_fps if max_fps > 0 else 0.0
         self._last_render_time = 0.0

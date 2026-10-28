@@ -46,14 +46,14 @@ class GlobalIdentityManager(IIdentityRepository):
 
     def _is_near_edge(self, bbox: list[float]) -> bool:
         x1, y1, x2, y2 = bbox
-        margin_x = self.frame_w * 0.04
-        margin_y = self.frame_h * 0.04
-        return (
-            (x1 < margin_x)
-            or (y1 < margin_y)
-            or (x2 > self.frame_w - margin_x)
-            or (y2 > self.frame_h - margin_y)
-        )
+        w = x2 - x1
+        h = y2 - y1
+        margin_x = self.frame_w * 0.03
+        margin_y = self.frame_h * 0.03
+        # Only treat as a truncated edge sliver when the crop is narrow and clipped by the frame border
+        clipped_x = ((x1 < margin_x) or (x2 > self.frame_w - margin_x)) and (w < self.frame_w * 0.25)
+        clipped_y = ((y1 < margin_y) or (y2 > self.frame_h - margin_y)) and (h < self.frame_h * 0.20)
+        return clipped_x or clipped_y
 
     def _cleanup_old_identities(self, current_time: float) -> None:
         # Throttle cleanup scan to once every 2 seconds to avoid per-frame dict iteration overhead

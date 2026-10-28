@@ -72,8 +72,8 @@ class BatchInferenceEngine:
 
         self.min_w = float(getattr(config, "MIN_BOX_WIDTH", 12))
         self.min_h = float(getattr(config, "MIN_BOX_HEIGHT", 24))
-        self.min_ar = float(getattr(config, "MIN_ASPECT_RATIO", 0.18))
-        self.max_ar = float(getattr(config, "MAX_ASPECT_RATIO", 0.95))
+        self.min_ar = float(getattr(config, "MIN_ASPECT_RATIO", 0.12))
+        self.max_ar = float(getattr(config, "MAX_ASPECT_RATIO", 3.50))
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self._lock = threading.Lock()
@@ -217,7 +217,8 @@ class BatchInferenceEngine:
 
         dets_batch = slot.pinned_dets[buf_idx].numpy()
         feats_batch = slot.pinned_feats[buf_idx].numpy()
-        max_area = float(self.width * self.height) * 0.85
+        frame_area = float(self.width * self.height)
+        max_area = frame_area * 0.65
 
         results_per_cam: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         for c in range(slot.batch_size):
@@ -235,6 +236,7 @@ class BatchInferenceEngine:
             h = y2 - y1
             ar = w / np.maximum(1.0, h)
             area = w * h
+            lens_occlusion = (h >= self.height * 0.96) & (area >= frame_area * 0.45)
 
             valid = (
                 (confs >= self.conf_low)
@@ -243,6 +245,7 @@ class BatchInferenceEngine:
                 & (ar >= self.min_ar)
                 & (ar <= self.max_ar)
                 & (area <= max_area)
+                & (~lens_occlusion)
             )
 
             if not np.any(valid):
@@ -270,7 +273,7 @@ class BatchInferenceEngine:
 
     @staticmethod
     def _nms_cpu(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
-        """Fast greedy NMS for small candidate sets (<= 16 boxes)."""
+        """Fast greedy NMS with containment suppression for small candidate sets (<= 16 boxes)."""
         order = scores.argsort()[::-1]
         keep = []
         x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -290,7 +293,8 @@ class BatchInferenceEngine:
             h = np.maximum(0.0, yy2 - yy1)
             inter = w * h
             iou = inter / (areas[i] + areas[rest] - inter)
-            order = rest[iou <= iou_threshold]
+            io_min = inter / np.minimum(areas[i], areas[rest])
+            order = rest[(iou <= iou_threshold) & (io_min <= 0.65)]
         return keep
 
     def infer_batch(self, frames: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:

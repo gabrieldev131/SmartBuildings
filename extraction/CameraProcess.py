@@ -48,28 +48,44 @@ def run_camera_process(
     reader.start()
 
     display = MultiCameraDisplay(config)
+    from vision.BatchInferenceEngine import BatchInferenceEngine
+    engine = BatchInferenceEngine(config)
     workers: dict[str, CameraWorker] = {}
 
     try:
         while not local_stop.is_set():
-            frames_dict = reader.get_latest()
-            if frames_dict is None:
+            frames_dict, new_cams = reader.get_batch_state()
+            if not frames_dict:
                 time.sleep(0.001)
                 continue
 
+            cam_ids = sorted(frames_dict.keys())
+            frames_list = [frames_dict[cid] for cid in cam_ids]
+            det_results = engine.infer_batch(frames_list)
+            now_ts = time.time()
+
             rendered_frames = {}
-            for cam_id, frame in frames_dict.items():
-                if cam_id not in workers:
+            for idx, cam_id in enumerate(cam_ids):
+                is_first = cam_id not in workers
+                if is_first:
                     logging.info(f"Nova câmera detectada automaticamente: '{cam_id}'...")
                     workers[cam_id] = CameraWorker(
                         cam_id=cam_id,
                         config=config,
                         global_manager=global_manager_proxy,
+                        inference_engine=engine,
                     )
 
-                worker = workers[cam_id]
-                disp_frame = worker.process_frame(frame)
-                rendered_frames[cam_id] = disp_frame if disp_frame is not None else frame
+                boxes_xyxy, confs, feats = det_results[idx]
+                disp_frame = workers[cam_id].process_detections(
+                    frame=frames_list[idx],
+                    boxes_xyxy=boxes_xyxy,
+                    confs=confs,
+                    feats=feats,
+                    current_time=now_ts,
+                    is_new_frame=(is_first or (cam_id in new_cams)),
+                )
+                rendered_frames[cam_id] = disp_frame
 
             if not display.render(rendered_frames):
                 stop_event.set()
@@ -85,5 +101,6 @@ def run_camera_process(
         reader.join(timeout=2.0)
         for worker in workers.values():
             worker.cleanup()
+        engine.cleanup()
         display.cleanup()
         logging.info(f"[{proc_name}] Processo encerrado.")
