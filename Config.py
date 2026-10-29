@@ -64,7 +64,7 @@ class Config:
     FONT_SCALE = 0.5
 
     # === KAFKA STREAMING ===
-    KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+    KAFKA_BOOTSTRAP_SERVERS = "10.145.80.61:9092"
     KAFKA_TOPIC = "meu-topico-de-video"
     KAFKA_GROUP_ID = "smart-builds-consumer"
     KAFKA_TARGET_CAMERA = None

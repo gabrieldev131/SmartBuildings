@@ -49,8 +49,9 @@ class FrameReaderManagement:
         """
         w = self.config.PROCESSING_WIDTH
         h = self.config.PROCESSING_HEIGHT
-        loop = getattr(self.config, "LOOP_LOCAL_VIDEOS", True)
-        pace = getattr(self.config, "VIDEO_FILE_REALTIME_PACING", False)
+        #loop = getattr(self.config, "LOOP_LOCAL_VIDEOS", True)
+        #pace = getattr(self.config, "VIDEO_FILE_REALTIME_PACING", False)
+        kafka_bootstrap = getattr(self.config, "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
         return [
             #RTSPCommandFactory(
@@ -64,7 +65,7 @@ class FrameReaderManagement:
             # Example local video or additional RTSP cameras (uncomment to scale up to 8 cameras):
             # RTSPCommandFactory(source="models/pessoas.mp4", width=w, height=h, cam_id="cam_2", loop_video=loop, pace_fps=pace),
             KafkaCommandFactory(
-                bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
+                bootstrap_servers=kafka_bootstrap,
                 topic=self.config.KAFKA_TOPIC,
                 group_id=self.config.KAFKA_GROUP_ID,
                 width=w,
