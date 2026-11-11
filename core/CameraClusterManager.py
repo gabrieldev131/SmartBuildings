@@ -4,31 +4,26 @@ import threading
 
 class CameraClusterManager:
     """
-    Algoritmo Union-Find iterativo para agrupar câmaras automaticamente.
-
-    Tem o seu próprio lock (independente do lock do GlobalIdentityManager)
-    porque self.parent também é lido em _aggregate_history_by_clusters,
-    que roda fora da seção crítica do GlobalIdentityManager (ver
-    get_identity_history / export_data_to_csv). Um RLock simples aqui é
-    suficiente: as operações são rápidas (find/union) e não chamam de volta
-    nenhum método do GlobalIdentityManager.
+    Thread-safe iterative Union-Find algorithm for automatic spatial camera clustering.
+    Tracks both cluster roots and full membership sets so the system can report
+    which cameras were merged into each Ambiente.
     """
+
     def __init__(self):
-        self.parent = {}
+        self.parent: dict[str, str] = {}
+        self.merge_history: list[dict] = []
         self._lock = threading.RLock()
 
-    def find(self, cam):
+    def find(self, cam: str) -> str:
         with self._lock:
             if cam not in self.parent:
                 self.parent[cam] = cam
                 return cam
 
-            # 1. Encontra a raiz de forma iterativa (não recursiva)
             root = cam
             while root != self.parent[root]:
                 root = self.parent[root]
 
-            # 2. Path compression iterativo (achata a árvore para buscas futuras em O(1))
             curr = cam
             while curr != root:
                 nxt = self.parent[curr]
@@ -37,7 +32,7 @@ class CameraClusterManager:
 
             return root
 
-    def union(self, cam1, cam2):
+    def union(self, cam1: str, cam2: str) -> bool:
         with self._lock:
             root1 = self.find(cam1)
             root2 = self.find(cam2)
@@ -48,3 +43,25 @@ class CameraClusterManager:
                     self.parent[root1] = root2
                 return True
             return False
+
+    def get_cluster_members(self, cam: str) -> list[str]:
+        """Return all camera IDs currently merged into the same cluster as `cam`."""
+        with self._lock:
+            target_root = self.find(cam)
+            members = [c for c in list(self.parent.keys()) if self.find(c) == target_root]
+            return sorted(members) if members else [cam]
+
+    def get_cluster_label(self, cam: str) -> str:
+        """Return a '+'-joined string of all cameras in the same cluster as `cam`."""
+        return "+".join(self.get_cluster_members(cam))
+
+    def get_all_clusters(self) -> dict[str, list[str]]:
+        """Return a mapping {root_cam: [member_cam1, member_cam2, ...]} for all known cameras."""
+        with self._lock:
+            clusters: dict[str, list[str]] = {}
+            for c in list(self.parent.keys()):
+                r = self.find(c)
+                clusters.setdefault(r, []).append(c)
+            for r in clusters:
+                clusters[r].sort()
+            return clusters

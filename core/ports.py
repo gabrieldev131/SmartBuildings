@@ -80,6 +80,16 @@ class IIdentityRepository(ABC):
     def export_data_to_csv(self, filename: str = "tracking_data_final.csv") -> None:
         pass
 
+    def record_stopped_state(
+        self,
+        global_id: int,
+        cam_id: str,
+        is_stopped: bool,
+        elapsed: float,
+        current_time: float,
+    ) -> None:
+        pass
+
 
 class IStateTracker(ABC):
     """Interface for behavioral state evaluation (moving vs. stopped/loitering)."""

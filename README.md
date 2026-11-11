@@ -202,3 +202,12 @@ Após coletar os dados em `tracking_data_final.csv`, execute o módulo de infer�
 ```bash
 ./venv/bin/python MarkovChain.py
 ```
+
+Logs every event type:
+          • PERSON_DETECTED: When and where each person first appeared.
+          • CAMERA_PASSAGE: Every individual camera passage where each person passed by (preserving the physical camera_id, origin_camera, next_camera, stopped_seconds, and full cameras_path).
+          • CAMERA_TRANSITION: Every cross-camera Re-ID match with transition duration and cosine distance.
+          • CAMERA_MERGE: Every camera cluster fusion event (merged_cameras, ambiente_id, triggering global_id, and transition time).
+          • PERSON_STOPPED: Every stopped/loitering episode and its duration.
+          • AMBIENTE_SUMMARY: Final aggregated stay per Ambiente_... including the full cameras_path and merged_cameras.
+

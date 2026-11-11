@@ -21,6 +21,16 @@ def extract_all_transitions(csv_path: str):
         print(f"Ficheiro {csv_path} não encontrado. Abortando.")
         return {}
 
+    if df.empty:
+        print(f"Ficheiro {csv_path} está vazio. Gerando cenário fictício complexo...")
+        return gerar_dados_ficticios()
+
+    # Se o CSV conter múltiplos tipos de eventos, filtramos apenas as passagens reais por câmara
+    if 'event_type' in df.columns:
+        df_passages = df[df['event_type'] == 'CAMERA_PASSAGE'].copy()
+        if not df_passages.empty:
+            df = df_passages
+
     # Se o CSV for o de teste que só tem 1 câmera, usamos os dados fictícios
     if len(df['camera_id'].unique()) <= 1:
         print("Aviso: Apenas uma câmara encontrada no CSV. Gerando cenário fictício complexo...")
