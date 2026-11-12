@@ -73,7 +73,8 @@ class IIdentityRepository(ABC):
         bbox: list[float],
         cam_id: str,
         current_time: float,
-    ) -> None:
+        active_global_ids: Optional[set[int]] = None,
+    ) -> Optional[int]:
         pass
 
     @abstractmethod

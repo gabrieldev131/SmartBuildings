@@ -13,7 +13,7 @@ class Config:
     EXECUTION_MODE = "batched"
     USE_CUDA_GRAPHS = True
     MAX_CAMERAS_BATCH = 8
-    MAX_DETECTIONS_PER_CAMERA = 16
+    MAX_DETECTIONS_PER_CAMERA = 28
 
     # Video file playback behavior:
     # False = process frames as fast as hardware allows (ideal for throughput testing)
@@ -23,24 +23,24 @@ class Config:
 
     # === YOLO DETECTION PARAMETERS ===
     YOLO_MODEL_PATH = "models/yolo26n.pt"
-    YOLO_CONF_HIGH = 0.45          # High-confidence threshold for primary tracking & appearance updates
-    YOLO_CONF_LOW = 0.28           # Low-confidence threshold for 2nd-stage occlusion recovery (ByteTrack-style)
-    YOLO_INIT_CONF = 0.52          # Minimum confidence required to initiate a brand-new local track
-    YOLO_IOU_THRESHOLD = 0.44      # Intra-class NMS IoU threshold to prevent duplicate boxes on one person
+    YOLO_CONF_HIGH = 0.28          # High-confidence threshold for primary tracking & appearance updates
+    YOLO_CONF_LOW = 0.18           # Low-confidence threshold for 2nd-stage occlusion/crowd recovery (ByteTrack-style)
+    YOLO_INIT_CONF = 0.30          # Minimum confidence required to initiate a brand-new local track
+    YOLO_IOU_THRESHOLD = 0.55      # Crowd-aware NMS IoU threshold to preserve close-proximity people
 
     # Geometric bounding-box validation (filters false positives such as furniture/reflections)
-    MIN_BOX_WIDTH = 16
-    MIN_BOX_HEIGHT = 32
-    MIN_ASPECT_RATIO = 0.15        # min (width / height)
-    MAX_ASPECT_RATIO = 2.80        # max (width / height) - supports close-up/seated/upper-body views
+    MIN_BOX_WIDTH = 14
+    MIN_BOX_HEIGHT = 28
+    MIN_ASPECT_RATIO = 0.14        # min (width / height)
+    MAX_ASPECT_RATIO = 2.85        # max (width / height) - supports close-up/seated/upper-body views
 
     # === DEEPSORT TRACKING PARAMETERS ===
-    DEEPSORT_MAX_AGE = 30          # Max frames an occluded local track is kept before handing off to Global Re-ID
-    DEEPSORT_N_INIT = 3            # Consecutive hits required to confirm a tentative track
-    DEEPSORT_MAX_IOU_DISTANCE = 0.55
-    DEEPSORT_MAX_COSINE_DISTANCE = 0.26
-    DEEPSORT_NN_BUDGET = 30        # Bounded appearance gallery per local track
-    DEEPSORT_MAX_COAST_FRAMES = 1  # Max frames to render damped prediction during 1-frame detector blink
+    DEEPSORT_MAX_AGE = 90          # Max frames an occluded local track is kept before handing off to Global Re-ID
+    DEEPSORT_N_INIT = 2            # Consecutive hits required to confirm a tentative track
+    DEEPSORT_MAX_IOU_DISTANCE = 0.62
+    DEEPSORT_MAX_COSINE_DISTANCE = 0.30
+    DEEPSORT_NN_BUDGET = 35        # Bounded appearance gallery per local track
+    DEEPSORT_MAX_COAST_FRAMES = 2  # Max frames to render damped prediction during brief detector/occlusion blink
     DEEPSORT_BOX_SMOOTH_ALPHA = 0.65  # EMA smoothing factor for bounding box stability (1.0 = no smoothing)
 
     # === STOPPED / LOITERING BEHAVIOR THRESHOLDS ===
@@ -49,14 +49,14 @@ class Config:
     MOVEMENT_BREAKOUT_THRESHOLD = 30
 
     # === BIFURCATED GLOBAL RE-ID THRESHOLDS ===
-    SIMILARITY_THRESHOLD = 0.24           # Strict: Intra-camera appearance re-identification
-    INTER_CAMERA_THRESHOLD = 0.28         # Cross-camera re-identification after leaving previous camera
-    SIMULTANEOUS_INTER_CAMERA_THRESHOLD = 0.18  # Extra-strict when identity is simultaneously active in another camera
+    SIMILARITY_THRESHOLD = 0.32           # Intra-camera appearance re-identification
+    INTER_CAMERA_THRESHOLD = 0.36         # Cross-camera re-identification after leaving previous camera
+    SIMULTANEOUS_INTER_CAMERA_THRESHOLD = 0.30  # Cross-camera threshold when identity is recently seen in another camera
 
-    MAX_SPATIAL_DISTANCE = 140
-    MAX_TIME_LOST = 15.0                  # Seconds an identity stays eligible for Re-ID after disappearing
-    CAMERA_SWITCH_COOLDOWN = 1.0          # Anti-ping-pong cooldown for overlapping camera views
-    AUTO_CLUSTER_TIME_THRESHOLD = 10.0    # Max transition time (s) to merge cameras into the same spatial cluster
+    MAX_SPATIAL_DISTANCE = 160
+    MAX_TIME_LOST = 120.0                 # Seconds an identity stays eligible for Re-ID after disappearing
+    CAMERA_SWITCH_COOLDOWN = 0.8          # Anti-ping-pong cooldown for overlapping camera views
+    AUTO_CLUSTER_TIME_THRESHOLD = 15.0    # Max transition time (s) to merge cameras into the same spatial cluster
 
     # Periodic global gallery EMA update interval (in frames) for already-mapped local tracks
     FEATURE_UPDATE_INTERVAL = 3

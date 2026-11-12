@@ -114,9 +114,10 @@ class VectorizedTrack:
             eff_alpha = min(0.92, alpha + 0.35 * min(1.0, center_shift / (0.12 * h)))
             smoothed = eff_alpha * target + (1.0 - eff_alpha) * prev_box
             self.smooth_ltrb = [float(x) for x in smoothed]
-        elif self.time_since_update == 1:
-            vx = float(self.mean[4]) * 0.25
-            vy = float(self.mean[5]) * 0.25
+        elif self.time_since_update in (1, 2):
+            damp = 0.30 if self.time_since_update == 1 else 0.15
+            vx = float(self.mean[4]) * damp
+            vy = float(self.mean[5]) * damp
             self.smooth_ltrb = [
                 float(prev_box[0] + vx),
                 float(prev_box[1] + vy),
@@ -135,17 +136,27 @@ class VectorizedTrack:
             return
         unit_feat = (feat / norm).astype(np.float32)
 
-        # Reject sudden appearance outliers (e.g. partial occlusion by another person)
         sim_to_ema = float(np.dot(self.ema_feat, unit_feat))
-        if self.hits >= 3 and sim_to_ema < 0.55:
+        # Reject sudden appearance outliers on mature tracks (e.g. partial occlusion by another person)
+        if self.hits > 4 and sim_to_ema < 0.52:
             return
 
-        ema = 0.85 * self.ema_feat + 0.15 * unit_feat
+        # Adapt quickly during the first 4 hits so noisy border-entry frames are replaced by full-body views
+        ema_weight = 0.55 if self.hits <= 4 else 0.84
+        ema = ema_weight * self.ema_feat + (1.0 - ema_weight) * unit_feat
         ema_norm = float(np.linalg.norm(ema))
         if ema_norm > 1e-6:
             self.ema_feat = (ema / ema_norm).astype(np.float32)
 
-        if len(self.gallery) >= self.nn_budget:
+        # Diversity-preserving gallery update: blend in-place if very similar to an existing sample
+        dots = self.gallery @ unit_feat
+        max_idx = int(np.argmax(dots))
+        if len(self.gallery) >= 3 and float(dots[max_idx]) > 0.93:
+            blended = 0.70 * self.gallery[max_idx] + 0.30 * unit_feat
+            b_norm = float(np.linalg.norm(blended))
+            if b_norm > 1e-6:
+                self.gallery[max_idx] = (blended / b_norm).astype(np.float32)
+        elif len(self.gallery) >= self.nn_budget:
             self.gallery = np.roll(self.gallery, -1, axis=0)
             self.gallery[-1] = unit_feat
         else:
@@ -232,23 +243,23 @@ class VectorizedDeepSort(IMultiObjectTracker):
         means[:, 6] = 0.0
 
         for i, t in enumerate(self.tracks):
-            if t.time_since_update == 1:
-                # Strongly damp velocity on first missed frame
-                means[i, 4:6] *= 0.25
+            if 1 <= t.time_since_update <= 6:
+                # Gradually damp velocity during brief occlusion so track follows person behind occluders
+                means[i, 4:6] *= 0.65
                 means[i, 6:8] = 0.0
-            elif t.time_since_update >= 2:
-                # Freeze velocity completely once occluded so track never drifts across the frame
+            elif t.time_since_update > 6:
+                # Freeze velocity after longer occlusion so track never drifts off-screen
                 means[i, 4:8] = 0.0
             t.age += 1
             t.time_since_update += 1
 
         # Update positions using damped velocities
         means[:, :4] += means[:, 4:]
-        means[:, 2] = np.clip(means[:, 2], 0.15, 2.80)
+        means[:, 2] = np.clip(means[:, 2], 0.14, 2.85)
         means[:, 3] = np.maximum(16.0, means[:, 3])
 
-        # Only grow covariance for actively visible / just-missed tracks (prevents covariance explosion)
-        active_cov_mask = np.array([t.time_since_update <= 2 for t in self.tracks], dtype=bool)
+        # Only grow covariance for actively visible / recently missed tracks (prevents covariance explosion)
+        active_cov_mask = np.array([t.time_since_update <= 4 for t in self.tracks], dtype=bool)
         if np.any(active_cov_mask):
             h = means[active_cov_mask, 3]
             p = (self._std_pos * h) ** 2
@@ -271,7 +282,7 @@ class VectorizedDeepSort(IMultiObjectTracker):
         for i, t in enumerate(self.tracks):
             t.mean = means[i]
             t.covariance = covs[i]
-            if t.time_since_update == 1:
+            if t.time_since_update in (1, 2):
                 t.sync_smooth_box(det_ltrb=None, alpha=self.box_smooth_alpha)
 
     def _kalman_update_batch(
@@ -334,8 +345,10 @@ class VectorizedDeepSort(IMultiObjectTracker):
             tr.det_conf = c_val
             tr.sync_smooth_box(det_boxes_xyxy[didx], alpha=self.box_smooth_alpha)
 
-            if tr.state == VectorizedTrack.TENTATIVE and tr.hits >= self.n_init:
-                tr.state = VectorizedTrack.CONFIRMED
+            if tr.state == VectorizedTrack.TENTATIVE:
+                req_hits = self.n_init if c_val >= 0.42 else (self.n_init + 1)
+                if tr.hits >= req_hits:
+                    tr.state = VectorizedTrack.CONFIRMED
             if not is_low_conf and embeds is not None and len(embeds) > didx:
                 is_clean = (c_val >= self.conf_high) and (clean_mask[didx] if clean_mask is not None else True)
                 tr.update_appearance(embeds[didx], is_clean=is_clean)
@@ -382,24 +395,27 @@ class VectorizedDeepSort(IMultiObjectTracker):
         d_h = np.maximum(16.0, sub_xyah[None, :, 3])
         scale_ratio = np.minimum(t_h, d_h) / np.maximum(t_h, d_h)
 
-        thresh = self.max_cosine_distance * (0.85 if strict_occlusion else 1.0)
+        thresh = self.max_cosine_distance * (0.92 if strict_occlusion else 1.0)
         cost = np.empty((K, M), dtype=np.float32)
 
         for r, tidx in enumerate(track_indices):
             tr = self.tracks[tidx]
-            min_d = 1.0 - (tr.gallery @ sub_embeds.T).max(axis=0)
+            dots = tr.gallery @ sub_embeds.T
+            min_d = 1.0 - dots.max(axis=0)
             ema_d = 1.0 - (tr.ema_feat @ sub_embeds.T)
-            app_cost = np.maximum(0.0, 0.60 * min_d + 0.40 * ema_d)
-            age_penalty = min(0.03, (tr.time_since_update - 1) * 0.005)
-            cost[r] = np.maximum(0.0, app_cost - 0.04 * iou_mat[r]) + age_penalty
+            app_cost = np.maximum(0.0, 0.65 * min_d + 0.35 * ema_d)
+            age_penalty = min(0.025, (tr.time_since_update - 1) * 0.003)
+            cost[r] = np.maximum(0.0, app_cost - 0.05 * iou_mat[r]) + age_penalty
 
-            # Maximum physical displacement allowed in local tracker
-            max_radius = float(t_h[r, 0]) * (0.55 + 0.12 * min(tr.time_since_update, 4))
-            invalid = (
-                (maha[r] > self.CHI2_INV_95_4D)
-                | (scale_ratio[r] < 0.58)
-                | (center_dist[r] > max_radius)
-            )
+            if strict_occlusion:
+                # For occluded tracks (tsu > 2), use expanding physical radius + scale check (not frozen Mahalanobis)
+                max_radius = max(160.0, float(t_h[r, 0]) * (0.95 + 0.18 * min(tr.time_since_update, 15)))
+                invalid = (scale_ratio[r] < 0.48) | (center_dist[r] > max_radius)
+            else:
+                # Active tracks (tsu <= 2): allow generous radius for fast walkers or lower-FPS streams
+                max_radius = max(90.0, float(t_h[r, 0]) * (0.75 + 0.22 * min(tr.time_since_update, 4)))
+                maha_bad = (maha[r] > (self.CHI2_INV_95_4D * 1.8)) & (iou_mat[r] < 0.12)
+                invalid = maha_bad | (scale_ratio[r] < 0.50) | (center_dist[r] > max_radius)
             cost[r, invalid] = self.INFTY_COST
 
         cost_gated = np.where(cost > thresh, thresh + 1e-5, cost)
@@ -417,8 +433,10 @@ class VectorizedDeepSort(IMultiObjectTracker):
 
     def _suppress_duplicate_tracks(self) -> None:
         """
-        Track-level NMS: if two active tracks overlap heavily on the same person,
-        retain the more established track and mark the duplicate as DELETED.
+        Crowd-safe Track-level NMS:
+        - Never suppresses two tracks that matched distinct detections in the current frame
+          unless both their bounding boxes and appearance embeddings are nearly identical.
+        - Preserves occluded tracks passing behind another person of different appearance.
         """
         alive_idx = [i for i, t in enumerate(self.tracks) if t.state != VectorizedTrack.DELETED]
         if len(alive_idx) <= 1:
@@ -444,17 +462,31 @@ class VectorizedDeepSort(IMultiObjectTracker):
         for a_pos in range(len(alive_idx)):
             if a_pos in suppressed:
                 continue
+            ta = self.tracks[alive_idx[a_pos]]
             for b_pos in range(a_pos + 1, len(alive_idx)):
                 if b_pos in suppressed:
                     continue
+                tb = self.tracks[alive_idx[b_pos]]
                 iou_val = iou_mat[a_pos, b_pos]
                 io_min_val = io_min_mat[a_pos, b_pos]
                 scale_sim = min(hs[a_pos], hs[b_pos]) / max(hs[a_pos], hs[b_pos])
                 dx_rel = abs(cxs[a_pos] - cxs[b_pos]) / max(ws[a_pos], ws[b_pos])
+                app_sim = float(np.dot(ta.ema_feat, tb.ema_feat))
 
-                if iou_val > 0.46 or (io_min_val > 0.68 and scale_sim > 0.52 and dx_rel < 0.30):
+                if ta.time_since_update == 0 and tb.time_since_update == 0:
+                    # Both tracks matched distinct detections in this frame: only suppress if true duplicate
+                    is_dup = (iou_val > 0.72 and app_sim > 0.78) or (
+                        io_min_val > 0.88 and scale_sim < 0.68 and dx_rel < 0.18 and app_sim > 0.72
+                    )
+                else:
+                    # At least one track is coasting/unmatched: only suppress if same person (high app_sim)
+                    is_dup = (iou_val > 0.55 and app_sim > 0.74) or (
+                        io_min_val > 0.80 and scale_sim > 0.60 and dx_rel < 0.22 and app_sim > 0.76
+                    )
+
+                if is_dup:
                     suppressed.add(b_pos)
-                    self.tracks[alive_idx[b_pos]].state = VectorizedTrack.DELETED
+                    tb.state = VectorizedTrack.DELETED
 
     def update(self, boxes_xyxy: np.ndarray, confs: np.ndarray, embeds: np.ndarray) -> list[VectorizedTrack]:
         """
@@ -464,7 +496,9 @@ class VectorizedDeepSort(IMultiObjectTracker):
 
         if len(boxes_xyxy) == 0:
             for tr in self.tracks:
-                if tr.state == VectorizedTrack.TENTATIVE or tr.time_since_update > self.max_age:
+                if (tr.state == VectorizedTrack.TENTATIVE and tr.time_since_update > 2) or (
+                    tr.time_since_update > self.max_age
+                ):
                     tr.state = VectorizedTrack.DELETED
             self.tracks = [t for t in self.tracks if t.state != VectorizedTrack.DELETED]
             return self.tracks
@@ -487,7 +521,7 @@ class VectorizedDeepSort(IMultiObjectTracker):
             det_iou, det_iomin = self._compute_iou_and_containment(high_boxes, high_boxes)
             np.fill_diagonal(det_iou, 0.0)
             np.fill_diagonal(det_iomin, 0.0)
-            high_clean = (det_iou.max(axis=1) < 0.25) & (det_iomin.max(axis=1) < 0.45)
+            high_clean = (det_iou.max(axis=1) < 0.18) & (det_iomin.max(axis=1) < 0.35)
         else:
             high_clean = np.ones(len(high_boxes), dtype=bool)
 
@@ -522,8 +556,8 @@ class VectorizedDeepSort(IMultiObjectTracker):
         # === STAGE B1: IoU + Appearance Gated Matching for Just-Missed Confirmed & Tentative Tracks ===
         iou_candidates = [
             i for i in active_confirmed_idx
-            if i not in matched_tracks_set and self.tracks[i].time_since_update == 1
-        ] + [i for i in unconfirmed_idx if self.tracks[i].time_since_update == 1]
+            if i not in matched_tracks_set and self.tracks[i].time_since_update <= 2
+        ] + [i for i in unconfirmed_idx if self.tracks[i].time_since_update <= 2]
 
         if iou_candidates and unmatched_high_dets:
             t_boxes = np.array([self.tracks[i].to_ltrb() for i in iou_candidates], dtype=np.float64)
@@ -537,11 +571,11 @@ class VectorizedDeepSort(IMultiObjectTracker):
             d_h = np.maximum(16.0, (d_boxes[:, 3] - d_boxes[:, 1])[None, :])
             scale_ratio = np.minimum(t_h, d_h) / np.maximum(t_h, d_h)
 
-            app_veto_thresh = self.max_cosine_distance * 1.15
+            app_veto_thresh = self.max_cosine_distance * 1.25
             for r, tidx in enumerate(iou_candidates):
                 tr = self.tracks[tidx]
                 app_d = 1.0 - (tr.ema_feat @ d_embs.T)
-                invalid = (app_d > app_veto_thresh) | (scale_ratio[r] < 0.68)
+                invalid = (app_d > app_veto_thresh) | (scale_ratio[r] < 0.55)
                 cost_iou[r, invalid] = self.INFTY_COST
 
             cost_gated = np.where(cost_iou > self.max_iou_distance, self.max_iou_distance + 1e-5, cost_iou)
@@ -575,33 +609,33 @@ class VectorizedDeepSort(IMultiObjectTracker):
             matches_high, high_boxes, high_xyah, high_confs, high_embeds, high_clean, is_low_conf=False
         )
 
-        # === STAGE B2: ByteTrack-Style Low-Confidence IoU + Appearance Recovery (tsu == 1 only) ===
-        remaining_confirmed = [
-            i for i in active_confirmed_idx
-            if i not in matched_tracks_set and self.tracks[i].time_since_update == 1
+        # === STAGE B2: ByteTrack-Style Low-Confidence IoU + Appearance Recovery (crowd/partial occlusion) ===
+        remaining_candidates = [
+            i for i in (active_confirmed_idx + unconfirmed_idx)
+            if i not in matched_tracks_set and self.tracks[i].time_since_update <= 2
         ]
         matches_low: list[tuple[int, int]] = []
-        if remaining_confirmed and len(low_boxes) > 0:
-            t_boxes = np.array([self.tracks[i].to_ltrb() for i in remaining_confirmed], dtype=np.float64)
+        if remaining_candidates and len(low_boxes) > 0:
+            t_boxes = np.array([self.tracks[i].to_ltrb() for i in remaining_candidates], dtype=np.float64)
             l_boxes = low_boxes.astype(np.float64)
             cost_iou = 1.0 - self._compute_iou_matrix(t_boxes, l_boxes)
-            low_iou_thresh = 0.45  # Requires IoU >= 0.55 for low-confidence recovery
+            low_iou_thresh = 0.58  # Requires IoU >= 0.42 for low-confidence crowd recovery
 
             t_h = np.maximum(16.0, t_boxes[:, 3:4] - t_boxes[:, 1:2])
             l_h = np.maximum(16.0, (l_boxes[:, 3] - l_boxes[:, 1])[None, :])
             scale_ratio = np.minimum(t_h, l_h) / np.maximum(t_h, l_h)
 
-            for r, tidx in enumerate(remaining_confirmed):
+            for r, tidx in enumerate(remaining_candidates):
                 tr = self.tracks[tidx]
                 app_d = 1.0 - (tr.ema_feat @ low_embeds.T)
-                invalid = (app_d > self.max_cosine_distance * 1.10) | (scale_ratio[r] < 0.75)
+                invalid = (app_d > self.max_cosine_distance * 1.20) | (scale_ratio[r] < 0.58)
                 cost_iou[r, invalid] = self.INFTY_COST
 
             cost_gated = np.where(cost_iou > low_iou_thresh, low_iou_thresh + 1e-5, cost_iou)
             row_ind, col_ind = linear_sum_assignment(cost_gated)
             for r, c in zip(row_ind, col_ind):
                 if cost_iou[r, c] <= low_iou_thresh:
-                    tidx = remaining_confirmed[r]
+                    tidx = remaining_candidates[r]
                     matches_low.append((tidx, c))
                     matched_tracks_set.add(tidx)
 
@@ -613,23 +647,39 @@ class VectorizedDeepSort(IMultiObjectTracker):
         # === Mark Missed Tracks ===
         for idx, tr in enumerate(self.tracks):
             if idx not in matched_tracks_set:
-                if tr.state == VectorizedTrack.TENTATIVE or tr.time_since_update > self.max_age:
+                if (tr.state == VectorizedTrack.TENTATIVE and tr.time_since_update > 2) or (
+                    tr.time_since_update > self.max_age
+                ):
                     tr.state = VectorizedTrack.DELETED
 
         # === Initiate New Tracks from Unmatched High-Confidence Detections ===
         for didx in unmatched_high_dets:
-            if float(high_confs[didx]) < self.init_conf:
+            c_val = float(high_confs[didx])
+            if c_val < self.init_conf:
                 continue
 
-            active_boxes = (
-                np.array([t.to_ltrb() for t in self.tracks if t.state != VectorizedTrack.DELETED], dtype=np.float64)
+            # Only compare against currently visible (matched in this frame) tracks so ghost tracks
+            # or nearby people never block a valid new person from being tracked
+            visible_boxes = (
+                np.array(
+                    [
+                        t.to_ltrb()
+                        for t in self.tracks
+                        if t.state != VectorizedTrack.DELETED and t.time_since_update == 0
+                    ],
+                    dtype=np.float64,
+                )
                 if self.tracks
                 else np.empty((0, 4), dtype=np.float64)
             )
-            if len(active_boxes) > 0:
+            if len(visible_boxes) > 0:
                 cand_box = high_boxes[didx : didx + 1].astype(np.float64)
-                iou_ov, iomin_ov = self._compute_iou_and_containment(active_boxes, cand_box)
-                if iou_ov.max() > 0.38 or iomin_ov.max() > 0.55:
+                iou_ov, iomin_ov = self._compute_iou_and_containment(visible_boxes, cand_box)
+                cand_h = max(16.0, float(cand_box[0, 3] - cand_box[0, 1]))
+                vis_hs = np.maximum(16.0, visible_boxes[:, 3] - visible_boxes[:, 1])
+                scale_ratios = np.minimum(vis_hs, cand_h) / np.maximum(vis_hs, cand_h)
+                is_subpart_dup = np.any((iomin_ov[:, 0] > 0.85) & (scale_ratios < 0.68) & (c_val < 0.55))
+                if iou_ov.max() > 0.68 or is_subpart_dup:
                     continue
 
             meas = high_xyah[didx]
@@ -644,9 +694,11 @@ class VectorizedDeepSort(IMultiObjectTracker):
                 mean=mean,
                 covariance=cov,
                 feat=high_embeds[didx],
-                conf=float(high_confs[didx]),
+                conf=c_val,
                 nn_budget=self.nn_budget,
             )
+            if self.n_init <= 1 or (c_val >= 0.72 and bool(high_clean[didx])):
+                new_track.state = VectorizedTrack.CONFIRMED
             self.tracks.append(new_track)
             self._next_id += 1
 

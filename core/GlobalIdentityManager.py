@@ -41,20 +41,20 @@ class GlobalIdentityManager(IIdentityRepository):
     def __init__(self, config=None):
         self.config = config
 
-        self.intra_camera_threshold = getattr(config, "SIMILARITY_THRESHOLD", 0.24)
-        self.inter_camera_threshold = getattr(config, "INTER_CAMERA_THRESHOLD", 0.28)
+        self.intra_camera_threshold = getattr(config, "SIMILARITY_THRESHOLD", 0.32)
+        self.inter_camera_threshold = getattr(config, "INTER_CAMERA_THRESHOLD", 0.36)
         self.simultaneous_inter_camera_threshold = getattr(
-            config, "SIMULTANEOUS_INTER_CAMERA_THRESHOLD", 0.18
+            config, "SIMULTANEOUS_INTER_CAMERA_THRESHOLD", 0.30
         )
-        self.max_time_lost = getattr(config, "MAX_TIME_LOST", 15.0)
+        self.max_time_lost = getattr(config, "MAX_TIME_LOST", 120.0)
 
-        max_dist = getattr(config, "MAX_SPATIAL_DISTANCE", 140)
+        max_dist = getattr(config, "MAX_SPATIAL_DISTANCE", 160)
         self.max_spatial_distance = float(max_dist)
         self.max_spatial_distance_sq = float(max_dist ** 2)
 
-        self.switch_cooldown = getattr(config, "CAMERA_SWITCH_COOLDOWN", 1.0)
+        self.switch_cooldown = getattr(config, "CAMERA_SWITCH_COOLDOWN", 0.8)
         self.cluster_manager = CameraClusterManager()
-        self.auto_cluster_threshold = getattr(config, "AUTO_CLUSTER_TIME_THRESHOLD", 10.0)
+        self.auto_cluster_threshold = getattr(config, "AUTO_CLUSTER_TIME_THRESHOLD", 15.0)
 
         self.frame_w = getattr(config, "PROCESSING_WIDTH", 640)
         self.frame_h = getattr(config, "PROCESSING_HEIGHT", 480)
@@ -135,6 +135,170 @@ class GlobalIdentityManager(IIdentityRepository):
                         }
                     )
 
+    def _find_best_matching_identity(
+        self,
+        new_feature_vector: np.ndarray,
+        bbox: list[float],
+        cam_id: str,
+        current_time: float,
+        active_global_ids: set[int],
+        max_candidate_id: Optional[int] = None,
+    ) -> tuple[Optional[int], float, float]:
+        best_match_id = None
+        best_distance = float("inf")
+        best_raw_app_dist = 0.0
+        cx, cy = self._get_center(bbox)
+        new_h = max(16.0, float(bbox[3] - bbox[1]))
+        target_cluster = self.cluster_manager.find(cam_id)
+
+        for global_id, identity_obj in self.identities.items():
+            if max_candidate_id is not None and global_id >= max_candidate_id:
+                continue
+            if global_id in active_global_ids:
+                continue
+
+            time_lost = current_time - identity_obj.last_seen
+            if time_lost > self.max_time_lost:
+                continue
+
+            appearance_dist = identity_obj.match_score(new_feature_vector, cam_id=cam_id)
+            is_same_camera = (identity_obj.current_camera == cam_id)
+
+            if is_same_camera:
+                ref_bbox = identity_obj.last_bbox_per_camera.get(cam_id, identity_obj.last_bbox)
+                old_cx, old_cy = self._get_center(ref_bbox)
+                old_h = max(16.0, float(ref_bbox[3] - ref_bbox[1]))
+                dist = float(np.hypot(cx - old_cx, cy - old_cy))
+                scale_ratio = min(new_h, old_h) / max(new_h, old_h)
+
+                # Physical speed & scale gate for recently lost tracks in the same camera
+                if time_lost < 3.0:
+                    max_allowed_dist = max(self.max_spatial_distance, 220.0 * max(0.40, time_lost))
+                    if dist > max_allowed_dist or scale_ratio < 0.45:
+                        continue
+
+                if time_lost < 2.0 and dist <= self.max_spatial_distance and scale_ratio >= 0.60:
+                    effective_dist = max(0.0, appearance_dist - 0.035)
+                else:
+                    effective_dist = appearance_dist
+
+                if effective_dist < best_distance and effective_dist < self.intra_camera_threshold:
+                    best_distance = effective_dist
+                    best_raw_app_dist = appearance_dist
+                    best_match_id = global_id
+            else:
+                # Cross-camera matching
+                seen_in_primary = identity_obj.last_seen_per_camera.get(
+                    identity_obj.current_camera, identity_obj.last_seen
+                )
+                time_since_primary = current_time - seen_in_primary
+                exiting_primary = self._is_near_edge(identity_obj.last_bbox)
+
+                if time_since_primary < 0.35 and not exiting_primary:
+                    thresh = self.simultaneous_inter_camera_threshold
+                else:
+                    thresh = self.inter_camera_threshold
+
+                # Temporal handoff bonus when person recently left another camera or moves within same cluster
+                same_cluster = (self.cluster_manager.find(identity_obj.current_camera) == target_cluster)
+                if 0.10 <= time_since_primary <= self.auto_cluster_threshold or (
+                    same_cluster and time_since_primary <= 25.0
+                ):
+                    effective_dist = max(0.0, appearance_dist - 0.030)
+                else:
+                    effective_dist = appearance_dist
+
+                if effective_dist < best_distance and effective_dist < thresh:
+                    best_distance = effective_dist
+                    best_raw_app_dist = appearance_dist
+                    best_match_id = global_id
+
+        return best_match_id, best_distance, best_raw_app_dist
+
+    def _merge_provisional_into_existing(
+        self,
+        prov_id: int,
+        target_id: int,
+        new_feature_vector: Optional[np.ndarray],
+        bbox: list[float],
+        cam_id: str,
+        current_time: float,
+        reid_distance: float,
+    ) -> int:
+        prov_ident = self.identities.get(prov_id)
+        target_ident = self.identities.get(target_id)
+        if prov_ident is None or target_ident is None:
+            return target_id
+
+        old_cam = target_ident.current_camera
+        prev_seen = target_ident.last_seen_per_camera.get(old_cam, target_ident.last_seen)
+        entry_ts = prov_ident.first_seen
+
+        if old_cam != cam_id:
+            self._check_and_update_clusters(target_ident, cam_id, entry_ts, reid_distance=reid_distance)
+
+        mudou_de_camera = target_ident.update(
+            new_feature_vector,
+            bbox,
+            cam_id,
+            current_time,
+            switch_cooldown=self.switch_cooldown,
+            reid_distance=reid_distance,
+            force_transition=(old_cam != cam_id),
+        )
+        # Preserve accurate entry timestamp & entry bbox from when the provisional track first appeared
+        if target_ident.passage_records and target_ident.passage_records[-1]["camera_id"] == cam_id:
+            target_ident.passage_records[-1]["timestamp_in"] = min(
+                target_ident.passage_records[-1]["timestamp_in"], entry_ts
+            )
+            if prov_ident.passage_records:
+                target_ident.passage_records[-1]["entry_bbox"] = list(
+                    prov_ident.passage_records[0]["entry_bbox"]
+                )
+
+        # Remove provisional PERSON_DETECTED event for prov_id and rebind any stopped events
+        self.event_log = [
+            ev
+            for ev in self.event_log
+            if not (ev.get("global_id") == prov_id and ev.get("event_type") == "PERSON_DETECTED")
+        ]
+        for ev in self.event_log:
+            if ev.get("global_id") == prov_id:
+                ev["global_id"] = target_id
+
+        if (prov_id, cam_id) in self._active_stopped_events:
+            ev = self._active_stopped_events.pop((prov_id, cam_id))
+            ev["global_id"] = target_id
+            self._active_stopped_events[(target_id, cam_id)] = ev
+
+        self.identities.pop(prov_id, None)
+        if self.next_global_id == prov_id + 1:
+            self.next_global_id = prov_id
+
+        if mudou_de_camera:
+            gap = max(0.0, entry_ts - prev_seen)
+            msg = (
+                f"Pessoa ID {target_id} moveu-se da câmara '{old_cam}' para '{cam_id}' "
+                f"após {gap:.2f}s (distância Re-ID={reid_distance:.3f})"
+            )
+            logging.info(f"Re-ID Evento (Consolidado ID {prov_id} -> ID {target_id}): {msg}")
+            self.event_log.append(
+                {
+                    "event_type": "CAMERA_TRANSITION",
+                    "global_id": target_id,
+                    "camera_id": cam_id,
+                    "origin_camera": old_cam,
+                    "next_camera": cam_id,
+                    "timestamp_in": prev_seen,
+                    "timestamp_out": entry_ts,
+                    "duration_seconds": gap,
+                    "stopped_seconds": 0.0,
+                    "reid_distance": float(reid_distance),
+                    "details": msg,
+                }
+            )
+        return target_id
+
     def update_existing_identity(
         self,
         global_id: int,
@@ -142,44 +306,95 @@ class GlobalIdentityManager(IIdentityRepository):
         bbox: list[float],
         cam_id: str,
         current_time: float,
-    ) -> None:
+        active_global_ids: Optional[set[int]] = None,
+    ) -> Optional[int]:
+        if active_global_ids is None:
+            active_global_ids = set()
+
         with self._lock:
             self.cluster_manager.find(cam_id)
             identity = self.identities.get(global_id)
-            if identity is not None:
-                prev_cam = identity.current_camera
-                prev_seen = identity.last_seen_per_camera.get(prev_cam, identity.last_seen)
-                feat_to_update = (
-                    None if (new_feature_vector is None or self._is_near_edge(bbox)) else new_feature_vector
+            if identity is None:
+                return None
+
+            is_edge = self._is_near_edge(bbox)
+            feat_to_update = None if (new_feature_vector is None or is_edge) else new_feature_vector
+
+            # 1. Online Provisional Identity Consolidation:
+            # If this identity was recently created on border entry and now has a clean interior feature,
+            # check if it actually belongs to an existing older identity (e.g. from another camera).
+            if (
+                feat_to_update is not None
+                and global_id > 1
+                and (current_time - identity.first_seen) <= 10.0
+                and len(identity.passage_records) == 1
+                and identity.passage_records[0].get("origin_camera") == "Entrada"
+            ):
+                exclude_ids = set(active_global_ids) | {global_id}
+                match_id, _, raw_dist = self._find_best_matching_identity(
+                    new_feature_vector=feat_to_update,
+                    bbox=bbox,
+                    cam_id=cam_id,
+                    current_time=current_time,
+                    active_global_ids=exclude_ids,
+                    max_candidate_id=global_id,
                 )
-                switched = identity.update(
-                    feat_to_update,
-                    bbox,
-                    cam_id,
-                    current_time,
-                    switch_cooldown=self.switch_cooldown,
-                )
-                if switched and prev_cam != cam_id:
-                    self._check_and_update_clusters(identity, cam_id, current_time, reid_distance=0.0)
-                    gap = max(0.0, current_time - prev_seen)
-                    self.event_log.append(
-                        {
-                            "event_type": "CAMERA_TRANSITION",
-                            "global_id": global_id,
-                            "camera_id": cam_id,
-                            "origin_camera": prev_cam,
-                            "next_camera": cam_id,
-                            "timestamp_in": prev_seen,
-                            "timestamp_out": current_time,
-                            "duration_seconds": gap,
-                            "stopped_seconds": 0.0,
-                            "reid_distance": 0.0,
-                            "details": (
-                                f"Pessoa ID {global_id} transitou da câmara '{prev_cam}' para '{cam_id}' "
-                                f"(intervalo={gap:.2f}s)"
-                            ),
-                        }
+                if match_id is not None:
+                    return self._merge_provisional_into_existing(
+                        prov_id=global_id,
+                        target_id=match_id,
+                        new_feature_vector=feat_to_update,
+                        bbox=bbox,
+                        cam_id=cam_id,
+                        current_time=current_time,
+                        reid_distance=raw_dist,
                     )
+
+            # 2. Cross-Camera Hijack Protection:
+            # If this identity already moved to another camera (`identity.current_camera != cam_id`),
+            # verify that the local track in `cam_id` still matches this person's appearance before
+            # allowing it to pull the identity back or contaminate the gallery.
+            prev_cam = identity.current_camera
+            if prev_cam != cam_id and new_feature_vector is not None:
+                verify_dist = identity.match_score(new_feature_vector, cam_id=cam_id)
+                if verify_dist > (self.inter_camera_threshold * 1.08):
+                    return None
+
+            prev_seen = identity.last_seen_per_camera.get(prev_cam, identity.last_seen)
+            switched = identity.update(
+                feat_to_update,
+                bbox,
+                cam_id,
+                current_time,
+                switch_cooldown=self.switch_cooldown,
+            )
+            if switched and prev_cam != cam_id:
+                self._check_and_update_clusters(identity, cam_id, current_time, reid_distance=0.0)
+                gap = max(0.0, current_time - prev_seen)
+                self.event_log.append(
+                    {
+                        "event_type": "CAMERA_TRANSITION",
+                        "global_id": global_id,
+                        "camera_id": cam_id,
+                        "origin_camera": prev_cam,
+                        "next_camera": cam_id,
+                        "timestamp_in": prev_seen,
+                        "timestamp_out": current_time,
+                        "duration_seconds": gap,
+                        "stopped_seconds": 0.0,
+                        "reid_distance": 0.0,
+                        "details": (
+                            f"Pessoa ID {global_id} transitou da câmara '{prev_cam}' para '{cam_id}' "
+                            f"(intervalo={gap:.2f}s)"
+                        ),
+                    }
+                )
+            return global_id
+
+    def get_identity_current_camera(self, global_id: int) -> Optional[str]:
+        with self._lock:
+            ident = self.identities.get(global_id)
+            return ident.current_camera if ident is not None else None
 
     def record_stopped_state(
         self,
@@ -192,7 +407,7 @@ class GlobalIdentityManager(IIdentityRepository):
         """Record stopped/loitering behavior on the active identity and event log."""
         with self._lock:
             identity = self.identities.get(global_id)
-            if identity is not None:
+            if identity is not None and identity.current_camera == cam_id:
                 identity.last_seen = max(identity.last_seen, current_time)
                 identity.last_seen_per_camera[cam_id] = max(
                     identity.last_seen_per_camera.get(cam_id, current_time), current_time
@@ -205,7 +420,7 @@ class GlobalIdentityManager(IIdentityRepository):
                     identity.update_stopped_duration(cam_id, elapsed, current_time)
 
             key = (global_id, cam_id)
-            if is_stopped and elapsed > 0.0:
+            if is_stopped and elapsed > 0.0 and (identity is None or identity.current_camera == cam_id):
                 t_start = current_time - elapsed
                 if key not in self._active_stopped_events:
                     ev = {
@@ -243,74 +458,17 @@ class GlobalIdentityManager(IIdentityRepository):
         if active_global_ids is None:
             active_global_ids = set()
 
-        best_match_id = None
-        best_distance = float("inf")
-        best_raw_app_dist = 0.0
-        cx, cy = self._get_center(bbox)
-        new_h = max(16.0, float(bbox[3] - bbox[1]))
-
         with self._lock:
             self.cluster_manager.find(cam_id)
             self._cleanup_old_identities(current_time)
 
-            for global_id, identity_obj in self.identities.items():
-                # Rule 1: Never assign a Global ID that is already actively tracked in the same camera frame
-                if global_id in active_global_ids:
-                    continue
-
-                time_lost = current_time - identity_obj.last_seen
-                if time_lost > self.max_time_lost:
-                    continue
-
-                appearance_dist = identity_obj.match_score(new_feature_vector)
-                is_same_camera = (identity_obj.current_camera == cam_id)
-
-                if is_same_camera:
-                    ref_bbox = identity_obj.last_bbox_per_camera.get(cam_id, identity_obj.last_bbox)
-                    old_cx, old_cy = self._get_center(ref_bbox)
-                    old_h = max(16.0, float(ref_bbox[3] - ref_bbox[1]))
-                    dist = float(np.hypot(cx - old_cx, cy - old_cy))
-                    scale_ratio = min(new_h, old_h) / max(new_h, old_h)
-
-                    # Anti-teleportation physical speed & scale gate for recently lost tracks in same camera
-                    if time_lost < 3.5:
-                        max_allowed_dist = max(self.max_spatial_distance, 175.0 * max(0.35, time_lost))
-                        if dist > max_allowed_dist or scale_ratio < 0.52:
-                            continue
-
-                    if time_lost < 1.5 and dist <= self.max_spatial_distance and scale_ratio >= 0.68:
-                        effective_dist = max(0.0, appearance_dist - 0.025)
-                    else:
-                        effective_dist = appearance_dist
-
-                    if effective_dist < best_distance and effective_dist < self.intra_camera_threshold:
-                        best_distance = effective_dist
-                        best_raw_app_dist = appearance_dist
-                        best_match_id = global_id
-                else:
-                    # Cross-camera matching:
-                    # Also ensure this identity isn't already actively tracked in `cam_id`
-                    seen_in_target_cam = identity_obj.last_seen_per_camera.get(cam_id)
-                    if seen_in_target_cam is not None and (current_time - seen_in_target_cam) < 0.4:
-                        continue
-
-                    # Check if the identity is simultaneously active right now in another camera
-                    seen_in_primary = identity_obj.last_seen_per_camera.get(
-                        identity_obj.current_camera, identity_obj.last_seen
-                    )
-                    time_since_primary = current_time - seen_in_primary
-
-                    if time_since_primary < 0.6:
-                        # Person is currently visible in another camera at the exact same moment:
-                        # Only match if cameras share overlapping view of the EXACT same person
-                        thresh = self.simultaneous_inter_camera_threshold
-                    else:
-                        thresh = self.inter_camera_threshold
-
-                    if appearance_dist < best_distance and appearance_dist < thresh:
-                        best_distance = appearance_dist
-                        best_raw_app_dist = appearance_dist
-                        best_match_id = global_id
+            best_match_id, _, best_raw_app_dist = self._find_best_matching_identity(
+                new_feature_vector=new_feature_vector,
+                bbox=bbox,
+                cam_id=cam_id,
+                current_time=current_time,
+                active_global_ids=active_global_ids,
+            )
 
             is_edge = self._is_near_edge(bbox)
             if best_match_id is not None:

@@ -19,14 +19,16 @@ class GlobalIdentity:
         bbox: list[float],
         initial_cam_id: str,
         start_time: float,
-        max_gallery_size: int = 15,
+        max_gallery_size: int = 32,
     ):
         self.global_id = global_id
 
         unit_feat = self._normalize(initial_feature)
         self.ema_feature: np.ndarray = unit_feat.copy()
+        self.camera_ema_features: dict[str, np.ndarray] = {initial_cam_id: unit_feat.copy()}
         self._gallery_matrix: np.ndarray = unit_feat.reshape(1, -1)
         self.max_gallery_size = max_gallery_size
+        self.update_count = 1
 
         self.last_bbox = list(bbox)
         self.last_bbox_per_camera: dict[str, list[float]] = {initial_cam_id: list(bbox)}
@@ -76,24 +78,66 @@ class GlobalIdentity:
         """Normalized EMA representation of this identity."""
         return self.ema_feature
 
-    def match_score(self, candidate_feature: np.ndarray) -> float:
+    def match_score(self, candidate_feature: np.ndarray, cam_id: Optional[str] = None) -> float:
         """
-        Compute hybrid cosine distance in [0.0, 1.0] combining the top gallery samples
-        and the stable EMA centroid to suppress single-frame outliers.
+        Compute hybrid cosine distance in [0.0, 1.0] combining the diverse multi-pose gallery,
+        per-camera EMA appearance memory, and the global EMA centroid.
         """
         candidate_norm = self._normalize(candidate_feature)
         dots = self._gallery_matrix @ candidate_norm
         best_gal_sim = float(np.max(dots))
         ema_sim = float(np.dot(self.ema_feature, candidate_norm))
 
+        if self.camera_ema_features:
+            if cam_id is not None and cam_id in self.camera_ema_features:
+                cam_sim = float(np.dot(self.camera_ema_features[cam_id], candidate_norm))
+                ema_sim = max(ema_sim, cam_sim)
+            else:
+                best_cam_sim = max(
+                    float(np.dot(c_vec, candidate_norm)) for c_vec in self.camera_ema_features.values()
+                )
+                ema_sim = max(ema_sim, best_cam_sim)
+
         if len(dots) >= 3:
-            top2_sim = float(np.mean(np.sort(dots)[-2:]))
-            gal_sim = 0.65 * best_gal_sim + 0.35 * top2_sim
+            k = min(3, len(dots))
+            topk_sim = float(np.mean(np.sort(dots)[-k:]))
+            gal_sim = 0.70 * best_gal_sim + 0.30 * topk_sim
         else:
             gal_sim = best_gal_sim
 
-        combined_sim = 0.60 * gal_sim + 0.40 * ema_sim
+        combined_sim = 0.72 * gal_sim + 0.28 * ema_sim
         return float(max(0.0, 1.0 - min(1.0, combined_sim)))
+
+    def _integrate_feature(self, unit_feat: np.ndarray, cam_id: str, force_accept: bool = False) -> None:
+        if float(np.dot(unit_feat, unit_feat)) <= 0.5:
+            return
+        sim_to_ema = float(np.dot(self.ema_feature, unit_feat))
+        gal_dots = self._gallery_matrix @ unit_feat
+        max_gal_sim = float(np.max(gal_dots))
+        max_gal_idx = int(np.argmax(gal_dots))
+
+        # Accept during early frames, forced transitions, or when consistent with EMA/gallery
+        if force_accept or self.update_count <= 3 or sim_to_ema >= 0.54 or max_gal_sim >= 0.58:
+            alpha = 0.60 if self.update_count <= 3 else 0.85
+            self.ema_feature = self._normalize(alpha * self.ema_feature + (1.0 - alpha) * unit_feat)
+            if cam_id in self.camera_ema_features:
+                self.camera_ema_features[cam_id] = self._normalize(
+                    0.80 * self.camera_ema_features[cam_id] + 0.20 * unit_feat
+                )
+            else:
+                self.camera_ema_features[cam_id] = unit_feat.copy()
+
+            # Diversity-preserving gallery: blend in-place if near-duplicate so standing still never erases other cameras/poses
+            if len(self._gallery_matrix) >= 3 and max_gal_sim > 0.92:
+                self._gallery_matrix[max_gal_idx] = self._normalize(
+                    0.72 * self._gallery_matrix[max_gal_idx] + 0.28 * unit_feat
+                )
+            elif len(self._gallery_matrix) >= self.max_gallery_size:
+                self._gallery_matrix = np.roll(self._gallery_matrix, -1, axis=0)
+                self._gallery_matrix[-1] = unit_feat
+            else:
+                self._gallery_matrix = np.vstack((self._gallery_matrix, unit_feat.reshape(1, -1)))
+            self.update_count += 1
 
     def update(
         self,
@@ -107,16 +151,7 @@ class GlobalIdentity:
     ) -> bool:
         if new_feature_vector is not None:
             unit_feat = self._normalize(new_feature_vector)
-            if float(np.dot(unit_feat, unit_feat)) > 0.5:
-                sim_to_ema = float(np.dot(self.ema_feature, unit_feat))
-                # Strict outlier gate prevents contaminating identity gallery during crowd crossings
-                if sim_to_ema >= 0.62 or len(self._gallery_matrix) < 2:
-                    self.ema_feature = self._normalize(0.86 * self.ema_feature + 0.14 * unit_feat)
-                    if len(self._gallery_matrix) >= self.max_gallery_size:
-                        self._gallery_matrix = np.roll(self._gallery_matrix, -1, axis=0)
-                        self._gallery_matrix[-1] = unit_feat
-                    else:
-                        self._gallery_matrix = np.vstack((self._gallery_matrix, unit_feat.reshape(1, -1)))
+            self._integrate_feature(unit_feat, cam_id, force_accept=force_transition)
 
         prev_seen_in_cam = self.last_seen_per_camera.get(cam_id)
         prev_seen_primary = self.last_seen_per_camera.get(self.current_camera, self.last_seen)

@@ -46,51 +46,83 @@ def extract_multistripe_embeddings_from_maps(
 ) -> torch.Tensor:
     """
     Core tensor graph computing centered 576D L2-normalized embeddings from:
-    - deep_map: (N, 576, 4, 2) high-level semantic horizontal stripes
-    - mid_map:  (N, 48, 8, 4) mid-level clothing texture/pattern horizontal stripes
-    - crops_rgb_01: (N, 3, 128, 64) 8-stripe 12-channel opponent color, luminance & chromaticity
+    - deep_map: (N, 576, 4, 2) high-level semantic horizontal stripes (vertically smoothed for viewpoint invariance)
+    - mid_map:  (N, 48, 8, 4) center-weighted mid-level clothing texture/pattern horizontal stripes
+    - crops_rgb_01: (N, 3, 128, 64) Gray-World white-balanced + contrast-normalized multi-scale color/chromaticity
     Shared identically by BatchInferenceEngine (CUDA Graph & CPU) and standalone extractors.
     """
-    # 1. Deep horizontal stripes + centered global context (576D)
-    g_avg = deep_map.mean(dim=(2, 3))  # (N, 576)
-    s4 = 0.70 * deep_map.mean(dim=3) + 0.30 * deep_map.amax(dim=3)  # (N, 576, 4)
+    # 1. Deep horizontal stripes + global semantic context (576D) with cross-stripe smoothing
+    g_avg = 0.68 * deep_map.mean(dim=(2, 3)) + 0.32 * deep_map.amax(dim=(2, 3))  # (N, 576)
+    s4_raw = 0.68 * deep_map.mean(dim=3) + 0.32 * deep_map.amax(dim=3)  # (N, 576, 4)
+    # Vertically smooth adjacent stripes so camera pitch/framing shifts do not cause sharp stripe jumps
+    s4_pad = F.pad(s4_raw, (1, 1), mode="replicate")
+    s4 = 0.65 * s4_raw + 0.175 * (s4_pad[:, :, :-2] + s4_pad[:, :, 2:])
+
     s4_grouped = s4.view(-1, 4, 144, 4).mean(dim=1)  # (N, 144, 4)
     deep_stripes = s4_grouped.permute(0, 2, 1).reshape(-1, 576)
     deep_stripes = deep_stripes - deep_stripes.mean(dim=1, keepdim=True)
     g_centered = g_avg - g_avg.mean(dim=1, keepdim=True)
-    deep_part = F.normalize(deep_stripes, dim=1) + 0.45 * F.normalize(g_centered, dim=1)
+    deep_part = F.normalize(deep_stripes, dim=1) + 0.55 * F.normalize(g_centered, dim=1)
     deep_part = F.normalize(deep_part, dim=1)
 
-    # 2. Mid-level texture horizontal stripes on center body (4 stripes x 48ch = 192D)
-    mid_center = F.adaptive_avg_pool2d(mid_map[:, :, :, 1:3], (4, 1)).flatten(1)  # (N, 192)
+    # 2. Mid-level texture horizontal stripes focused on inner body core (4 stripes x 48ch = 192D)
+    mid_inner = 0.82 * mid_map[:, :, :, 1:3].mean(dim=3, keepdim=True) + 0.18 * mid_map.mean(dim=3, keepdim=True)
+    mid_4 = F.adaptive_avg_pool2d(mid_inner, (4, 1)).flatten(1)  # (N, 192)
+    mid_2 = F.adaptive_avg_pool2d(mid_inner, (2, 1)).repeat(1, 1, 2, 1).flatten(1)  # (N, 192)
+    mid_center = 0.70 * mid_4 + 0.30 * mid_2
     mid_center = mid_center - mid_center.mean(dim=1, keepdim=True)
     mid_part = F.normalize(mid_center, dim=1)
 
-    # 3. 8-Stripe 12-Channel Color + Luminance + Opponent Chromaticity + Saturation on inner torso/legs
-    body = crops_rgb_01[:, :, 12:116, 16:48].float()
-    r, g, b = body[:, 0:1], body[:, 1:2], body[:, 2:3]
-    lum = 0.299 * r + 0.587 * g + 0.114 * b
-    rg = (r - g) * 1.4
-    yb = (0.5 * (r + g) - b) * 1.4
-    sum_rgb = (r + g + b).clamp(min=1e-2)
-    rn = r / sum_rgb
-    gn = g / sum_rgb
-    bn = b / sum_rgb
-    cmax = torch.maximum(torch.maximum(r, g), b)
-    cmin = torch.minimum(torch.minimum(r, g), b)
+    # 3. Illumination-Invariant (Gray-World White-Balanced + Chromaticity) Multi-Scale Color on inner torso/legs
+    body = crops_rgb_01[:, :, 14:114, 16:48].float()
+    # Horizontal foreground weighting: emphasize torso center (x=8..24 of 32) to reject background & adjacent people
+    r_raw, g_raw, b_raw = body[:, 0:1], body[:, 1:2], body[:, 2:3]
+
+    # Gray-World per-crop white balance normalization (compensates cross-camera exposure & color temperature)
+    ch_mean = body.mean(dim=(2, 3), keepdim=True).clamp(min=0.10, max=0.92)
+    lum_mean = ch_mean.mean(dim=1, keepdim=True)
+    wb_body = (body * (lum_mean / ch_mean)).clamp(0.0, 1.0)
+    rw, gw, bw = wb_body[:, 0:1], wb_body[:, 1:2], wb_body[:, 2:3]
+
+    lum = 0.299 * r_raw + 0.587 * g_raw + 0.114 * b_raw
+    lum_std = lum.std(dim=(2, 3), keepdim=True).clamp(min=0.06)
+    lum_norm = ((lum - lum.mean(dim=(2, 3), keepdim=True)) / lum_std).clamp(-2.5, 2.5) * 0.25 + 0.5
+
+    rg = (rw - gw) * 1.35
+    yb = (0.5 * (rw + gw) - bw) * 1.35
+    sum_rgb = (r_raw + g_raw + b_raw).clamp(min=1e-2)
+    rn = r_raw / sum_rgb
+    gn = g_raw / sum_rgb
+    bn = b_raw / sum_rgb
+    sum_wb = (rw + gw + bw).clamp(min=1e-2)
+    rwn = rw / sum_wb
+    gwn = gw / sum_wb
+    bwn = bw / sum_wb
+    cmax = torch.maximum(torch.maximum(rw, gw), bw)
+    cmin = torch.minimum(torch.minimum(rw, gw), bw)
     sat = (cmax - cmin) / (cmax + 1e-2)
 
-    col_stack = torch.cat([r, g, b, lum, rg, yb, rn, gn, bn, sat, r - lum, b - lum], dim=1)  # 12 channels
-    col_avg = F.adaptive_avg_pool2d(col_stack, (8, 1)).flatten(1)  # (N, 96)
-    col_max = F.adaptive_max_pool2d(col_stack, (8, 1)).flatten(1)  # (N, 96)
-    col_feat = torch.cat([col_avg, 0.70 * col_max], dim=1)  # (N, 192)
+    # 12 illumination-robust channels combining white-balanced opponent colors, chromaticity, saturation & contrast
+    col_stack = torch.cat(
+        [rw, gw, bw, lum_norm, rg, yb, rn, gn, bn, sat, rwn - gwn, bwn - 0.5 * (rwn + gwn)], dim=1
+    )  # 12 channels
+    # Center-heavy horizontal pooling (inner 16px core weighted 75%, full 32px torso weighted 25%)
+    col_core = 0.75 * col_stack[:, :, :, 8:24].mean(dim=3, keepdim=True) + 0.25 * col_stack.mean(dim=3, keepdim=True)
+    col_avg_8 = F.adaptive_avg_pool2d(col_core, (8, 1)).flatten(1)  # (N, 96)
+    col_coarse_4 = F.interpolate(
+        F.adaptive_avg_pool2d(col_core, (4, 1)), size=(8, 1), mode="bilinear", align_corners=False
+    ).flatten(1)  # (N, 96)
+    col_max_8 = F.adaptive_max_pool2d(col_core, (8, 1)).flatten(1)  # (N, 96)
+
+    col_fine = 0.65 * col_avg_8 + 0.35 * col_coarse_4
+    col_feat = torch.cat([col_fine, 0.65 * col_coarse_4 + 0.35 * col_max_8], dim=1)  # (N, 192)
     col_feat = col_feat - col_feat.mean(dim=1, keepdim=True)
     col_part = F.normalize(col_feat, dim=1).to(deep_part.dtype)
 
-    # Fuse into 3 orthogonal 192D blocks = 576D L2-normalized embedding
-    b1 = F.normalize(deep_part[:, :192] + 0.50 * deep_part[:, 192:384], dim=1)
-    b2 = F.normalize(0.75 * deep_part[:, 384:] + 0.65 * mid_part, dim=1)
-    out = torch.cat([b1, b2, 1.15 * col_part], dim=1)
+    # Fuse into 3 balanced 192D blocks = 576D L2-normalized embedding
+    b1 = F.normalize(deep_part[:, :192] + 0.55 * deep_part[:, 192:384], dim=1)
+    b2 = F.normalize(0.75 * deep_part[:, 384:] + 0.68 * mid_part, dim=1)
+    out = torch.cat([b1, b2, 0.95 * col_part], dim=1)
     return F.normalize(out, dim=1)
 
 

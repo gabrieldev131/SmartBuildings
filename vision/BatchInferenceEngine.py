@@ -9,6 +9,7 @@ import logging
 import threading
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.ops import roi_align
 from ultralytics import YOLO
@@ -91,8 +92,17 @@ class BatchInferenceEngine:
         self._lock = threading.Lock()
         self._stream = torch.cuda.Stream(device=self.device) if self.use_gpu else None
 
-        # Load and fuse YOLO model on the selected device
+        # Load and fuse YOLO model on the selected device while preserving the one2many head for crowd recall
         yolo = YOLO(self.config.YOLO_MODEL_PATH, task="detect", verbose=False)
+        raw_head = yolo.model.model[-1]
+        cv2_o2m = getattr(raw_head, "cv2", None)
+        cv3_o2m = getattr(raw_head, "cv3", None)
+        if cv2_o2m is not None and cv3_o2m is not None:
+            for mod_list in (cv2_o2m, cv3_o2m):
+                for sub_m in mod_list.modules():
+                    if hasattr(sub_m, "fuse"):
+                        sub_m.fuse()
+
         if self.use_gpu:
             dummy = torch.zeros((1, 3, self.height, self.width), device=self.device, dtype=torch.float16)
             yolo.predict(dummy, device=self.device, half=True, verbose=False)
@@ -102,20 +112,78 @@ class BatchInferenceEngine:
             yolo.predict(dummy, device="cpu", half=False, verbose=False)
             self.net = yolo.model.to(self.device).eval().float()
 
-        # Patch Detect head postprocess to directly extract top-K class-0 (person) candidates
         head = self.net.model[-1]
+        if cv2_o2m is not None and cv3_o2m is not None:
+            head.cv2 = cv2_o2m.to(self.device).eval()
+            head.cv3 = cv3_o2m.to(self.device).eval()
+            if self.use_gpu:
+                head.cv2.half()
+                head.cv3.half()
+            else:
+                head.cv2.float()
+                head.cv3.float()
+
         max_dets = self.max_dets
         nc = head.nc
+        has_dual_head = bool(getattr(head, "end2end", False)) and (head.cv2 is not None) and (head.cv3 is not None)
 
-        def _person_only_postprocess(preds: torch.Tensor) -> torch.Tensor:
-            boxes, scores = preds.split([4, nc], dim=-1)
-            person_scores = scores[..., 0:1]
-            top_scores, idx = person_scores.topk(max_dets, dim=1)
-            top_boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
-            cls_zero = torch.zeros_like(top_scores)
-            return torch.cat([top_boxes, top_scores, cls_zero], dim=-1)
+        if has_dual_head:
+            def _dual_head_person_forward(x: list[torch.Tensor]):
+                o2o_raw = head.forward_head(x, **head.one2one)
+                o2m_raw = head.forward_head(x, **head.one2many)
+                o2o = head._inference(o2o_raw).permute(0, 2, 1)  # (B, N, 4 + nc)
+                o2m = head._inference(o2m_raw).permute(0, 2, 1)  # (B, N, 4 + nc)
 
-        head.postprocess = _person_only_postprocess
+                b_o2o, sc_o2o = o2o.split([4, nc], dim=-1)
+                b_o2m, sc_o2m = o2m.split([4, nc], dim=-1)
+
+                p_o2o = sc_o2o[..., 0:1]
+                other_o2o = sc_o2o[..., 1:].amax(dim=-1, keepdim=True)
+                p_o2o = torch.where(p_o2o >= other_o2o * 0.75, p_o2o, torch.zeros_like(p_o2o))
+
+                p_o2m = sc_o2m[..., 0:1]
+                other_o2m = sc_o2m[..., 1:].amax(dim=-1, keepdim=True)
+                p_o2m = torch.where(p_o2m >= other_o2m * 0.80, p_o2m, torch.zeros_like(p_o2m))
+
+                # 3x3 spatial peak selection on one2many per FPN level to recover close/occluded people
+                bsz = p_o2m.shape[0]
+                peak_masks = []
+                offset = 0
+                for feat in o2m_raw["feats"]:
+                    fh, fw = feat.shape[-2], feat.shape[-1]
+                    flen = fh * fw
+                    s_lvl = p_o2m[:, offset : offset + flen, 0].view(bsz, 1, fh, fw)
+                    pk = (s_lvl == F.max_pool2d(s_lvl, 3, stride=1, padding=1)).view(bsz, flen, 1)
+                    peak_masks.append(pk)
+                    offset += flen
+                peak_mask = torch.cat(peak_masks, dim=1)
+                p_o2m_peak = torch.where(peak_mask, p_o2m * 0.92, torch.zeros_like(p_o2m))
+
+                use_o2m = p_o2m_peak > p_o2o
+                best_scores = torch.where(use_o2m, p_o2m_peak, p_o2o)
+                best_boxes = torch.where(use_o2m.expand(-1, -1, 4), b_o2m, b_o2o)
+
+                top_scores, idx = best_scores.topk(max_dets, dim=1)
+                top_boxes = best_boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
+                cls_zero = torch.zeros_like(top_scores)
+                out = torch.cat([top_boxes, top_scores, cls_zero], dim=-1)
+                return (out, o2o_raw)
+
+            head.forward = _dual_head_person_forward
+        else:
+            def _person_only_postprocess(preds: torch.Tensor) -> torch.Tensor:
+                boxes, scores = preds.split([4, nc], dim=-1)
+                person_scores = scores[..., 0:1]
+                other_max = scores[..., 1:].amax(dim=-1, keepdim=True)
+                person_scores = torch.where(
+                    person_scores >= other_max * 0.75, person_scores, torch.zeros_like(person_scores)
+                )
+                top_scores, idx = person_scores.topk(max_dets, dim=1)
+                top_boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
+                cls_zero = torch.zeros_like(top_scores)
+                return torch.cat([top_boxes, top_scores, cls_zero], dim=-1)
+
+            head.postprocess = _person_only_postprocess
 
         # Load MobileNetV3-Small Re-ID backbone split into mid-level (layer 8) and deep (layer 12)
         self.backbone = models.mobilenet_v3_small(
@@ -145,7 +213,12 @@ class BatchInferenceEngine:
         def _forward_pass():
             t_rgb = slot.static_bgr.flip(-1).permute(0, 3, 1, 2).contiguous().to(dtype).div_(255.0)
             preds = self.net(t_rgb)[0]  # (B, max_dets, 6)
-            rois = torch.cat([slot.batch_idx_static, preds[..., :4].to(dtype)], dim=-1).reshape(-1, 5)
+            b_x1 = preds[..., 0:1].clamp(0.0, float(self.width))
+            b_y1 = preds[..., 1:2].clamp(0.0, float(self.height))
+            b_x2 = preds[..., 2:3].clamp(0.0, float(self.width))
+            b_y2 = preds[..., 3:4].clamp(0.0, float(self.height))
+            clamped_boxes = torch.cat([b_x1, b_y1, b_x2, b_y2], dim=-1).to(dtype)
+            rois = torch.cat([slot.batch_idx_static, clamped_boxes], dim=-1).reshape(-1, 5)
             crops = roi_align(t_rgb, rois, output_size=(128, 64), spatial_scale=1.0, aligned=True)
 
             crops_norm = (crops - self._mean) / self._std
@@ -247,8 +320,7 @@ class BatchInferenceEngine:
             lens_occlusion = (h >= self.height * 0.96) & (area >= frame_area * 0.45)
 
             # Reject narrow edge slivers (e.g. half an arm/shoulder cut off by image boundary)
-            edge_sliver = ((x1 <= 3.0) | (x2 >= self.width - 3.0)) & (w < 26.0) & (confs < 0.65)
-            top_bottom_artifact = ((y1 <= 2.0) & (y2 < self.height * 0.22) & (confs < 0.48))
+            edge_sliver = ((x1 <= 3.0) | (x2 >= self.width - 3.0)) & (w < 20.0) & (confs < 0.55)
 
             valid = (
                 (confs >= self.conf_low)
@@ -259,7 +331,6 @@ class BatchInferenceEngine:
                 & (area <= max_area)
                 & (~lens_occlusion)
                 & (~edge_sliver)
-                & (~top_bottom_artifact)
             )
 
             if not np.any(valid):
@@ -274,7 +345,7 @@ class BatchInferenceEngine:
             v_confs = confs[valid].astype(np.float32)
             v_feats = c_feats[valid].copy()
 
-            # Intra-class NMS with part-box suppression
+            # Crowd-aware intra-class NMS with part-box suppression
             if len(v_boxes) > 1:
                 keep = self._nms_cpu(v_boxes, v_confs, self.iou_thresh)
                 v_boxes = v_boxes[keep]
@@ -288,11 +359,11 @@ class BatchInferenceEngine:
     @staticmethod
     def _nms_cpu(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
         """
-        Scale-aware greedy NMS for person detections:
-        - Suppresses duplicate boxes on the same person with IoU > iou_threshold.
-        - Suppresses partial-body sub-boxes (e.g. head/torso box inside full-body box) via io_min
-          and horizontal center alignment, while preserving high-confidence background people
-          partially occluded by a larger foreground person.
+        Crowd-aware greedy NMS for person detections:
+        - Preserves distinct people standing close together or partially occluded (IoU <= iou_threshold).
+        - Suppresses duplicate anchor predictions on the exact same person center.
+        - Suppresses true partial-body sub-boxes (e.g. head/torso box inside full-body box on the same vertical axis)
+          without suppressing a second person standing beside or behind a foreground person.
         """
         order = scores.argsort()[::-1]
         keep = []
@@ -300,6 +371,7 @@ class BatchInferenceEngine:
         w_all = np.maximum(1.0, x2 - x1)
         h_all = np.maximum(1.0, y2 - y1)
         cx_all = x1 + 0.5 * w_all
+        cy_all = y1 + 0.5 * h_all
         areas = w_all * h_all
 
         while order.size > 0:
@@ -318,19 +390,24 @@ class BatchInferenceEngine:
             iou = inter / (areas[i] + areas[rest] - inter)
             io_min = inter / np.minimum(areas[i], areas[rest])
 
-            # Check if smaller box is horizontally aligned with the larger box (sub-part of same person)
-            dx_norm = np.abs(cx_all[i] - cx_all[rest]) / np.maximum(w_all[i], w_all[rest])
-            scale_ratio = np.minimum(h_all[i], h_all[rest]) / np.maximum(h_all[i], h_all[rest])
+            max_w = np.maximum(w_all[i], w_all[rest])
+            max_h = np.maximum(h_all[i], h_all[rest])
+            dx_norm = np.abs(cx_all[i] - cx_all[rest]) / max_w
+            dy_norm = np.abs(cy_all[i] - cy_all[rest]) / max_h
+            scale_ratio = np.minimum(h_all[i], h_all[rest]) / max_h
+            top_aligned = np.abs(y1[i] - y1[rest]) < (0.12 * max_h)
 
-            # Suppress if:
-            # 1) Standard IoU exceeds threshold, OR
-            # 2) Strong containment (io_min > 0.72) when candidate is not a distinct high-conf small person, OR
-            # 3) Moderate containment (io_min > 0.55) and horizontally aligned on the same body column
+            # 1) Duplicate prediction on the exact same person center (e.g. one2one + one2many anchor pair)
+            same_center_dup = (iou > 0.44) & (dx_norm < 0.15) & (dy_norm < 0.15) & (scale_ratio > 0.78)
+
+            # 2) True partial-body sub-box (significantly shorter box contained inside full-body box on same column)
             is_subpart = (
-                (io_min > 0.78)
-                | ((io_min > 0.56) & (dx_norm < 0.28) & ((scores[rest] < 0.72) | (scale_ratio > 0.45)))
+                (scale_ratio < 0.72)
+                & (io_min > 0.84)
+                & (dx_norm < 0.20)
+                & ((scores[rest] < 0.52) | top_aligned)
             )
-            suppress = (iou > iou_threshold) | is_subpart
+            suppress = (iou > iou_threshold) | same_center_dup | is_subpart
             order = rest[~suppress]
         return keep
 
