@@ -214,9 +214,6 @@ models/
 # DNN models
 *.pt
 
-# data rasters
-*.csv
-
 #examples
 examples/
 teste2.py

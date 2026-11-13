@@ -1,0 +1,6 @@
+,Cam_Corredor1,Cam_Corredor2,Cam_Recepcao,Cam_Refeitorio,Saida_Norte,Saida_Principal,Saida_Sul
+Cam_Corredor1,0.0000,0.0000,0.2999,0.4968,0.2033,0.0000,0.0000
+Cam_Corredor2,0.0000,0.0000,0.8642,0.0000,0.0000,0.0000,0.1358
+Cam_Entrada,0.7134,0.2866,0.0000,0.0000,0.0000,0.0000,0.0000
+Cam_Recepcao,0.0000,0.0000,0.0000,0.0000,0.0000,1.0000,0.0000
+Cam_Refeitorio,0.3031,0.0000,0.0000,0.0000,0.6969,0.0000,0.0000
