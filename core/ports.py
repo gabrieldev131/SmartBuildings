@@ -1,58 +1,50 @@
 # core/ports.py
 """
-Application Ports (Interfaces) following Clean Architecture & Dependency Inversion Principle (DIP).
-Outer layers (extraction, vision, ui) implement these abstractions while core business logic
-depends only on these contracts.
+Application Ports (Interfaces) following Clean Architecture & Open/Closed Principle (OCP).
 """
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple
 import numpy as np
 
+from core.domain import BehaviorResult, TrackContext
+
 
 class IFrameCommand(ABC):
-    """
-    Command Pattern interface for frame extraction from heterogeneous video sources
-    (RTSP cameras, local video files, Apache Kafka streams).
-    """
+    """Command Pattern interface for reading video frames from RTSP, local files, or Kafka."""
 
     @abstractmethod
     def execute(self) -> Optional[Tuple[str, Any]]:
-        """Execute a single frame extraction step and return (cam_id, frame) or None."""
         pass
 
     @abstractmethod
     def cleanup(self) -> None:
-        """Release underlying I/O handles, network sockets, or video capture descriptors."""
         pass
 
 
 class ICommandFactory(ABC):
-    """
-    Abstract Factory Pattern interface for creating picklable IFrameCommand instances
-    across process boundaries.
-    """
+    """Abstract Factory Pattern interface for creating picklable IFrameCommand instances."""
 
     @abstractmethod
     def __call__(self) -> IFrameCommand:
-        """Instantiate and return a concrete IFrameCommand."""
         pass
 
 
-class IMultiObjectTracker(ABC):
+class IBehaviorAnalyzer(ABC):
     """
-    Strategy / Adapter Pattern interface for multi-target within-camera tracking.
+    Strategy / Plugin Pattern interface for decoupled behavioral analysis.
+    To add a new functionality (e.g., Stopped/Loitering, Restricted Zone, Running, Fall Detection),
+    implement `analyze(context: TrackContext) -> BehaviorResult` and register the analyzer in
+    `BehaviorPipeline` — no changes to `CameraWorker`, `display.py`, or `GlobalIdentityManager` needed.
     """
 
     @abstractmethod
-    def update(self, boxes_xyxy: np.ndarray, confs: np.ndarray, embeds: np.ndarray) -> list[Any]:
-        """Update tracker state with current frame detections and appearance embeddings."""
+    def analyze(self, context: TrackContext) -> BehaviorResult:
+        """Evaluate behavior for a tracked person and return a standardized `BehaviorResult`."""
         pass
 
 
 class IIdentityRepository(ABC):
-    """
-    Repository Pattern interface for cross-camera Global Re-Identification and trajectory persistence.
-    """
+    """Repository Pattern interface for cross-camera Global Re-ID and CSV export."""
 
     @abstractmethod
     def get_or_create_global_id(
@@ -81,19 +73,22 @@ class IIdentityRepository(ABC):
     def export_data_to_csv(self, filename: str = "tracking_data_final.csv") -> None:
         pass
 
-    def record_stopped_state(
+    def record_behavior_event(
         self,
         global_id: int,
         cam_id: str,
-        is_stopped: bool,
-        elapsed: float,
+        behavior_name: str,
+        event_type: str,
+        is_active: bool,
+        duration_seconds: float,
         current_time: float,
+        details: str = "",
     ) -> None:
         pass
 
 
 class IStateTracker(ABC):
-    """Interface for behavioral state evaluation (moving vs. stopped/loitering)."""
+    """Legacy interface kept for backward compatibility."""
 
     @abstractmethod
     def update_and_evaluate(self, global_id: int, box: list[float], current_time: float) -> Tuple[bool, float]:

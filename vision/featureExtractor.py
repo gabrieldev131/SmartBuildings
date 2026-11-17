@@ -1,9 +1,9 @@
 # vision/featureExtractor.py
 """
 High-Performance Re-Identification Feature Extractor (GPU FP16 / CPU FP32).
-Combines MobileNetV3-Small Mid-Level Texture Stripes + Deep Semantic Horizontal Stripes
-with 8-Stripe 12-Channel Opponent Color, Luminance, Saturation & Chromaticity descriptors.
-Respects Config.USE_GPU for seamless GPU or CPU execution.
+Uses Torchvision's `mobilenet_v3_small` and `roi_align` to compute 576D L2-normalized
+embeddings combining deep semantic stripes, mid-level texture stripes, and
+illumination-invariant (Gray-World white-balanced) color descriptors.
 """
 import numpy as np
 import torch
@@ -13,30 +13,22 @@ from torchvision.ops import roi_align
 
 from Config import Config
 
-_use_gpu_cfg = bool(getattr(Config, "USE_GPU", True))
-_device = torch.device("cuda:0" if (_use_gpu_cfg and torch.cuda.is_available()) else "cpu")
-_use_fp16 = _device.type == "cuda"
+EMBEDDING_DIM = 576
 
-_backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT).features
-_backbone.to(_device).eval()
-if _use_fp16:
-    _backbone.half()
+_use_gpu = bool(getattr(Config, "USE_GPU", True)) and torch.cuda.is_available()
+_device = torch.device("cuda:0" if _use_gpu else "cpu")
+_dtype = torch.float16 if _use_gpu else torch.float32
 
+_backbone = (
+    models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+    .features.to(_device, dtype=_dtype)
+    .eval()
+)
 _backbone_mid = _backbone[:9]
 _backbone_deep = _backbone[9:]
 
-_dtype = torch.float16 if _use_fp16 else torch.float32
 _mean = torch.tensor([0.485, 0.456, 0.406], device=_device, dtype=_dtype).view(1, 3, 1, 1)
 _std = torch.tensor([0.229, 0.224, 0.225], device=_device, dtype=_dtype).view(1, 3, 1, 1)
-
-# Pre-warm common batch buckets on GPU to avoid cuDNN runtime autotuning stalls
-_BUCKETS = (1, 4, 8, 16, 24, 32, 48, 64, 96, 128)
-_pad_buf = torch.zeros((128, 3, 128, 64), device=_device, dtype=_dtype) if _use_fp16 else None
-if _use_fp16:
-    with torch.inference_mode():
-        for _b in _BUCKETS:
-            _ = _backbone(_pad_buf[:_b])
-    torch.cuda.synchronize()
 
 
 def extract_multistripe_embeddings_from_maps(
@@ -45,43 +37,35 @@ def extract_multistripe_embeddings_from_maps(
     deep_map: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Core tensor graph computing centered 576D L2-normalized embeddings from:
-    - deep_map: (N, 576, 4, 2) high-level semantic horizontal stripes (vertically smoothed for viewpoint invariance)
-    - mid_map:  (N, 48, 8, 4) center-weighted mid-level clothing texture/pattern horizontal stripes
-    - crops_rgb_01: (N, 3, 128, 64) Gray-World white-balanced + contrast-normalized multi-scale color/chromaticity
-    Shared identically by BatchInferenceEngine (CUDA Graph & CPU) and standalone extractors.
+    Compute 576D L2-normalized appearance embeddings from:
+    - deep_map: (N, 576, 4, 2) high-level semantic feature maps
+    - mid_map:  (N, 48, 8, 4) mid-level clothing texture feature maps
+    - crops_rgb_01: (N, 3, 128, 64) RGB person crops in [0, 1]
     """
-    # 1. Deep horizontal stripes + global semantic context (576D) with cross-stripe smoothing
-    g_avg = 0.68 * deep_map.mean(dim=(2, 3)) + 0.32 * deep_map.amax(dim=(2, 3))  # (N, 576)
-    s4_raw = 0.68 * deep_map.mean(dim=3) + 0.32 * deep_map.amax(dim=3)  # (N, 576, 4)
-    # Vertically smooth adjacent stripes so camera pitch/framing shifts do not cause sharp stripe jumps
+    # 1. Deep semantic horizontal stripes + global context (576D)
+    g_avg = 0.68 * deep_map.mean(dim=(2, 3)) + 0.32 * deep_map.amax(dim=(2, 3))
+    s4_raw = 0.68 * deep_map.mean(dim=3) + 0.32 * deep_map.amax(dim=3)
     s4_pad = F.pad(s4_raw, (1, 1), mode="replicate")
     s4 = 0.65 * s4_raw + 0.175 * (s4_pad[:, :, :-2] + s4_pad[:, :, 2:])
 
-    s4_grouped = s4.view(-1, 4, 144, 4).mean(dim=1)  # (N, 144, 4)
-    deep_stripes = s4_grouped.permute(0, 2, 1).reshape(-1, 576)
+    deep_stripes = s4.view(-1, 4, 144, 4).mean(dim=1).permute(0, 2, 1).reshape(-1, 576)
     deep_stripes = deep_stripes - deep_stripes.mean(dim=1, keepdim=True)
     g_centered = g_avg - g_avg.mean(dim=1, keepdim=True)
-    deep_part = F.normalize(deep_stripes, dim=1) + 0.55 * F.normalize(g_centered, dim=1)
-    deep_part = F.normalize(deep_part, dim=1)
+    deep_part = F.normalize(F.normalize(deep_stripes, dim=1) + 0.55 * F.normalize(g_centered, dim=1), dim=1)
 
-    # 2. Mid-level texture horizontal stripes focused on inner body core (4 stripes x 48ch = 192D)
+    # 2. Mid-level clothing texture horizontal stripes on inner torso (192D)
     mid_inner = 0.82 * mid_map[:, :, :, 1:3].mean(dim=3, keepdim=True) + 0.18 * mid_map.mean(dim=3, keepdim=True)
-    mid_4 = F.adaptive_avg_pool2d(mid_inner, (4, 1)).flatten(1)  # (N, 192)
-    mid_2 = F.adaptive_avg_pool2d(mid_inner, (2, 1)).repeat(1, 1, 2, 1).flatten(1)  # (N, 192)
+    mid_4 = F.adaptive_avg_pool2d(mid_inner, (4, 1)).flatten(1)
+    mid_2 = F.adaptive_avg_pool2d(mid_inner, (2, 1)).repeat(1, 1, 2, 1).flatten(1)
     mid_center = 0.70 * mid_4 + 0.30 * mid_2
-    mid_center = mid_center - mid_center.mean(dim=1, keepdim=True)
-    mid_part = F.normalize(mid_center, dim=1)
+    mid_part = F.normalize(mid_center - mid_center.mean(dim=1, keepdim=True), dim=1)
 
-    # 3. Illumination-Invariant (Gray-World White-Balanced + Chromaticity) Multi-Scale Color on inner torso/legs
+    # 3. Illumination-invariant Gray-World white-balanced color & chromaticity stripes (192D)
     body = crops_rgb_01[:, :, 14:114, 16:48].float()
-    # Horizontal foreground weighting: emphasize torso center (x=8..24 of 32) to reject background & adjacent people
     r_raw, g_raw, b_raw = body[:, 0:1], body[:, 1:2], body[:, 2:3]
 
-    # Gray-World per-crop white balance normalization (compensates cross-camera exposure & color temperature)
     ch_mean = body.mean(dim=(2, 3), keepdim=True).clamp(min=0.10, max=0.92)
-    lum_mean = ch_mean.mean(dim=1, keepdim=True)
-    wb_body = (body * (lum_mean / ch_mean)).clamp(0.0, 1.0)
+    wb_body = (body * (ch_mean.mean(dim=1, keepdim=True) / ch_mean)).clamp(0.0, 1.0)
     rw, gw, bw = wb_body[:, 0:1], wb_body[:, 1:2], wb_body[:, 2:3]
 
     lum = 0.299 * r_raw + 0.587 * g_raw + 0.114 * b_raw
@@ -91,110 +75,66 @@ def extract_multistripe_embeddings_from_maps(
     rg = (rw - gw) * 1.35
     yb = (0.5 * (rw + gw) - bw) * 1.35
     sum_rgb = (r_raw + g_raw + b_raw).clamp(min=1e-2)
-    rn = r_raw / sum_rgb
-    gn = g_raw / sum_rgb
-    bn = b_raw / sum_rgb
     sum_wb = (rw + gw + bw).clamp(min=1e-2)
-    rwn = rw / sum_wb
-    gwn = gw / sum_wb
-    bwn = bw / sum_wb
+    rwn, gwn, bwn = rw / sum_wb, gw / sum_wb, bw / sum_wb
     cmax = torch.maximum(torch.maximum(rw, gw), bw)
     cmin = torch.minimum(torch.minimum(rw, gw), bw)
     sat = (cmax - cmin) / (cmax + 1e-2)
 
-    # 12 illumination-robust channels combining white-balanced opponent colors, chromaticity, saturation & contrast
     col_stack = torch.cat(
-        [rw, gw, bw, lum_norm, rg, yb, rn, gn, bn, sat, rwn - gwn, bwn - 0.5 * (rwn + gwn)], dim=1
-    )  # 12 channels
-    # Center-heavy horizontal pooling (inner 16px core weighted 75%, full 32px torso weighted 25%)
+        [
+            rw, gw, bw, lum_norm, rg, yb,
+            r_raw / sum_rgb, g_raw / sum_rgb, b_raw / sum_rgb,
+            sat, rwn - gwn, bwn - 0.5 * (rwn + gwn),
+        ],
+        dim=1,
+    )
     col_core = 0.75 * col_stack[:, :, :, 8:24].mean(dim=3, keepdim=True) + 0.25 * col_stack.mean(dim=3, keepdim=True)
-    col_avg_8 = F.adaptive_avg_pool2d(col_core, (8, 1)).flatten(1)  # (N, 96)
+    col_avg_8 = F.adaptive_avg_pool2d(col_core, (8, 1)).flatten(1)
     col_coarse_4 = F.interpolate(
         F.adaptive_avg_pool2d(col_core, (4, 1)), size=(8, 1), mode="bilinear", align_corners=False
-    ).flatten(1)  # (N, 96)
-    col_max_8 = F.adaptive_max_pool2d(col_core, (8, 1)).flatten(1)  # (N, 96)
+    ).flatten(1)
+    col_max_8 = F.adaptive_max_pool2d(col_core, (8, 1)).flatten(1)
 
-    col_fine = 0.65 * col_avg_8 + 0.35 * col_coarse_4
-    col_feat = torch.cat([col_fine, 0.65 * col_coarse_4 + 0.35 * col_max_8], dim=1)  # (N, 192)
-    col_feat = col_feat - col_feat.mean(dim=1, keepdim=True)
-    col_part = F.normalize(col_feat, dim=1).to(deep_part.dtype)
+    col_feat = torch.cat([0.65 * col_avg_8 + 0.35 * col_coarse_4, 0.65 * col_coarse_4 + 0.35 * col_max_8], dim=1)
+    col_part = F.normalize(col_feat - col_feat.mean(dim=1, keepdim=True), dim=1).to(deep_part.dtype)
 
     # Fuse into 3 balanced 192D blocks = 576D L2-normalized embedding
     b1 = F.normalize(deep_part[:, :192] + 0.55 * deep_part[:, 192:384], dim=1)
     b2 = F.normalize(0.75 * deep_part[:, 384:] + 0.68 * mid_part, dim=1)
-    out = torch.cat([b1, b2, 0.95 * col_part], dim=1)
-    return F.normalize(out, dim=1)
+    return F.normalize(torch.cat([b1, b2, 0.95 * col_part], dim=1), dim=1)
 
 
 @torch.inference_mode()
-def compute_part_based_embeddings(crops_rgb_01: torch.Tensor) -> torch.Tensor:
-    """
-    Given RGB crops in [0, 1] of shape (N, 3, 128, 64) on _device:
-    Returns L2-normalized (N, 576) multi-stripe embeddings.
-    """
-    n = crops_rgb_01.shape[0]
-    if n == 0:
-        return torch.empty((0, 576), device=crops_rgb_01.device, dtype=torch.float32)
+def extract_embeddings_from_crops(crops_rgb_01: torch.Tensor) -> torch.Tensor:
+    """Extract 576D L2-normalized embeddings from RGB crops of shape (N, 3, 128, 64) in [0, 1]."""
+    if len(crops_rgb_01) == 0:
+        return torch.empty((0, EMBEDDING_DIM), device=crops_rgb_01.device, dtype=torch.float32)
 
     crops_norm = (crops_rgb_01.to(_dtype) - _mean) / _std
-
-    if _use_fp16 and _pad_buf is not None and n <= 128 and crops_norm.device == _device:
-        bucket = next((b for b in _BUCKETS if b >= n), n)
-        if bucket > n:
-            _pad_buf[:n].copy_(crops_norm)
-            mid_map = _backbone_mid(_pad_buf[:bucket])[:n]
-        else:
-            mid_map = _backbone_mid(crops_norm)
-    else:
-        mid_map = _backbone_mid(crops_norm)
-
+    mid_map = _backbone_mid(crops_norm)
     deep_map = _backbone_deep(mid_map)
-    return extract_multistripe_embeddings_from_maps(crops_rgb_01, mid_map, deep_map)
+    return extract_multistripe_embeddings_from_maps(crops_rgb_01, mid_map, deep_map).float()
 
 
 @torch.inference_mode()
 def extract_features_batch_from_frame(frame: np.ndarray, boxes_xyxy: np.ndarray) -> np.ndarray:
-    """
-    Extract 576D L2-normalized embeddings for all bounding boxes in a single frame in one batch.
-    """
+    """Extract 576D L2-normalized embeddings for all bounding boxes in a single BGR frame."""
     if len(boxes_xyxy) == 0:
-        return np.empty((0, 576), dtype=np.float32)
+        return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
-    t_bgr = torch.from_numpy(frame).to(_device, non_blocking=_use_fp16)
+    t_bgr = torch.from_numpy(frame).to(_device, non_blocking=_use_gpu)
     t_rgb = t_bgr.flip(-1).permute(2, 0, 1).unsqueeze(0).contiguous().to(_dtype).div_(255.0)
-
-    boxes_t = torch.as_tensor(boxes_xyxy, device=_device, dtype=_dtype)
-    batch_col = torch.zeros((len(boxes_xyxy), 1), device=_device, dtype=_dtype)
-    rois = torch.cat([batch_col, boxes_t[:, :4]], dim=1)
+    boxes_t = torch.as_tensor(boxes_xyxy[:, :4], device=_device, dtype=_dtype)
+    rois = torch.cat([torch.zeros((len(boxes_t), 1), device=_device, dtype=_dtype), boxes_t], dim=1)
 
     crops = roi_align(t_rgb, rois, output_size=(128, 64), spatial_scale=1.0, aligned=True)
-    feats = compute_part_based_embeddings(crops)
-    return feats.float().cpu().numpy()
+    return extract_embeddings_from_crops(crops).cpu().numpy()
 
 
 @torch.inference_mode()
 def extract_deep_reid_feature(frame: np.ndarray, box: list) -> np.ndarray:
-    """
-    Extract a single 576D L2-normalized embedding for one bounding box.
-    """
-    x1, y1, x2, y2 = map(int, box[:4])
-    h_img, w_img = frame.shape[:2]
-    x1_c, y1_c = max(0, x1), max(0, y1)
-    x2_c, y2_c = min(w_img, x2), min(h_img, y2)
-
-    if (x2_c - x1_c) < 10 or (y2_c - y1_c) < 15:
-        return np.zeros(576, dtype=np.float32)
-
-    crop = frame[y1_c:y2_c, x1_c:x2_c]
-    t_bgr = torch.from_numpy(crop).to(_device)
-    t_rgb = t_bgr.flip(-1).permute(2, 0, 1).unsqueeze(0).contiguous().to(_dtype).div_(255.0)
-    t_resized = F.interpolate(t_rgb, size=(128, 64), mode="bilinear", align_corners=False)
-
-    feat = compute_part_based_embeddings(t_resized)
-    return feat[0].float().cpu().numpy()
-
-
-# Backward-compatible aliases
-extract_color_histogram = extract_deep_reid_feature
-extract_color_histogram_fast = extract_deep_reid_feature
-extract_color_histogram_rich = extract_deep_reid_feature
+    """Extract a single 576D L2-normalized embedding for one [x1, y1, x2, y2] bounding box."""
+    boxes = np.asarray([box[:4]], dtype=np.float32)
+    feats = extract_features_batch_from_frame(frame, boxes)
+    return feats[0] if len(feats) > 0 else np.zeros(EMBEDDING_DIM, dtype=np.float32)

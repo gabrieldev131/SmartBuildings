@@ -1,9 +1,14 @@
 # core/StoppedStateTracker.py
+"""
+Stopped / Loitering Behavior Analyzer plugin implementing `IBehaviorAnalyzer`.
+Can be plugged into `BehaviorPipeline` or toggled on/off without modifying `CameraWorker`.
+"""
 from collections import deque
-from core.ports import IStateTracker
+from core.domain import BehaviorResult, TrackContext
+from core.ports import IBehaviorAnalyzer, IStateTracker
 
 
-class StoppedStateTracker(IStateTracker):
+class StoppedStateTracker(IBehaviorAnalyzer, IStateTracker):
     """
     Behavioral Finite State Machine evaluating whether each tracked person is
     moving or stopped/loitering using spatial hysteresis and sliding time windows.
@@ -20,6 +25,7 @@ class StoppedStateTracker(IStateTracker):
         self._stopped_sec = getattr(config, "STOPPED_SECONDS_THRESHOLD", 3)
         self._stopped_px_sq = getattr(config, "STOPPED_PIXEL_THRESHOLD", 15) ** 2
         self._breakout_px_sq = getattr(config, "MOVEMENT_BREAKOUT_THRESHOLD", 30) ** 2
+        self._color_stopped = getattr(config, "COLOR_STOPPED", (0, 0, 255))
 
     def _cleanup_stale(self, current_time: float, max_idle: float = 60.0) -> None:
         if (current_time - self._last_cleanup) < 10.0:
@@ -54,11 +60,9 @@ class StoppedStateTracker(IStateTracker):
 
         start_pos = history[0][1]
         end_pos = history[-1][1]
-
         squared_displacement = (end_pos[0] - start_pos[0]) ** 2 + (end_pos[1] - start_pos[1]) ** 2
-        currently_stopped = self.stopped_state[global_id]
 
-        if currently_stopped:
+        if self.stopped_state[global_id]:
             if squared_displacement > self._breakout_px_sq:
                 self.stopped_state[global_id] = False
                 self.stopped_since[global_id] = current_time
@@ -71,3 +75,22 @@ class StoppedStateTracker(IStateTracker):
 
         elapsed = (current_time - self.stopped_since[global_id]) if self.stopped_state[global_id] else 0.0
         return self.stopped_state[global_id], elapsed
+
+    def analyze(self, context: TrackContext) -> BehaviorResult:
+        """Standard `IBehaviorAnalyzer` plugin entrypoint."""
+        is_stopped, elapsed = self.update_and_evaluate(
+            context.global_id, context.bbox, context.current_time
+        )
+        return BehaviorResult(
+            name="stopped",
+            is_active=is_stopped,
+            label_suffix=f"PARADO {int(elapsed)}s" if is_stopped else "",
+            color_override=self._color_stopped if is_stopped else None,
+            event_type="PERSON_STOPPED",
+            duration_seconds=elapsed,
+            details=(
+                f"Pessoa ID {context.global_id} ficou parada em '{context.cam_id}' por {elapsed:.1f}s"
+                if is_stopped
+                else ""
+            ),
+        )

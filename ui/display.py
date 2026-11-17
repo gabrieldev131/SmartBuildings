@@ -9,6 +9,30 @@ import cv2
 import numpy as np
 
 
+def draw_annotation_spec(frame: np.ndarray, spec, config) -> None:
+    """Draw bounding box and dynamic badge from a `BehaviorPipeline` `AnnotationSpec`."""
+    h_img, w_img = frame.shape[:2]
+    x1 = max(0, min(w_img - 1, int(spec.bbox[0])))
+    y1 = max(0, min(h_img - 1, int(spec.bbox[1])))
+    x2 = max(0, min(w_img - 1, int(spec.bbox[2])))
+    y2 = max(0, min(h_img - 1, int(spec.bbox[3])))
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), spec.color, 2)
+    (tw, th), _ = cv2.getTextSize(spec.label, cv2.FONT_HERSHEY_SIMPLEX, config.FONT_SCALE, 1)
+    top_y = max(th + 6, y1)
+    cv2.rectangle(frame, (x1, top_y - th - 6), (x1 + tw + 4, top_y), (0, 0, 0), -1)
+    cv2.putText(
+        frame,
+        spec.label,
+        (x1 + 2, top_y - 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        config.FONT_SCALE,
+        spec.color,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def draw_person_annotation(frame: np.ndarray, box: list[float], global_id: int, is_stopped: bool, elapsed: float, config) -> None:
     """Draw bounding box and identity/state badge for a tracked person."""
     h_img, w_img = frame.shape[:2]

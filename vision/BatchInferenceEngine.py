@@ -1,24 +1,22 @@
 # vision/BatchInferenceEngine.py
 """
-Unified Batched Inference Engine with GPU (FP16 + CUDA Graphs) and CPU (FP32) Support.
-Executes multi-camera YOLO26n detection + Intra-Class NMS + ROI-Align + MobileNetV3
-Multi-Stripe Mid/Deep & 12-Channel Opponent/Luminance Re-ID extraction.
-Configurable via Config.USE_GPU (True = CUDA GPU if available, False = CPU).
+Batched Inference Engine with GPU (FP16 + CUDA Graphs) and CPU (FP32) support.
+Uses Ultralytics YOLO26n (`one2one` head with non-person/furniture class suppression)
+and Torchvision (`roi_align`, `nms`, `box_iou`, `mobilenet_v3_small`) for Re-ID extraction.
 """
 import logging
 import threading
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision.models as models
-from torchvision.ops import roi_align
+from torchvision.ops import box_iou, nms, roi_align
 from ultralytics import YOLO
 
-from vision.featureExtractor import extract_multistripe_embeddings_from_maps
+from vision.featureExtractor import EMBEDDING_DIM, extract_multistripe_embeddings_from_maps
 
 
 class _GraphSlot:
-    """Encapsulates static device & host buffers for a specific camera batch size B."""
+    """Static device and pinned host buffers for a specific camera batch size B."""
 
     def __init__(
         self,
@@ -30,14 +28,8 @@ class _GraphSlot:
         dtype: torch.dtype,
     ):
         self.batch_size = batch_size
-        self.height = height
-        self.width = width
-        self.max_dets = max_dets
-        self.device = device
-        self.dtype = dtype
         use_pin = (device.type == "cuda") and torch.cuda.is_available()
 
-        # Double-buffered host input/output buffers (slot 0 and slot 1)
         self.pinned_in = [
             torch.empty((batch_size, height, width, 3), dtype=torch.uint8, pin_memory=use_pin)
             for _ in range(2)
@@ -47,11 +39,10 @@ class _GraphSlot:
             for _ in range(2)
         ]
         self.pinned_feats = [
-            torch.empty((batch_size, max_dets, 576), dtype=torch.float32, pin_memory=use_pin)
+            torch.empty((batch_size, max_dets, EMBEDDING_DIM), dtype=torch.float32, pin_memory=use_pin)
             for _ in range(2)
         ]
 
-        # Static device tensors bound to the captured CUDA Graph (or eager execution)
         self.static_bgr = torch.empty((batch_size, height, width, 3), device=device, dtype=torch.uint8)
         self.batch_idx_static = (
             torch.arange(batch_size, device=device, dtype=dtype)
@@ -65,159 +56,94 @@ class _GraphSlot:
 
 
 class BatchInferenceEngine:
-    """
-    Centralized Engine for multi-camera person detection and multi-stripe Re-ID extraction.
-    Supports both GPU (CUDA FP16 + CUDA Graphs) and CPU (FP32) controlled by Config.USE_GPU.
-    """
+    """Centralized multi-camera person detection and Re-ID feature extraction engine."""
 
     def __init__(self, config):
         self.config = config
         self.width = getattr(config, "PROCESSING_WIDTH", 640)
         self.height = getattr(config, "PROCESSING_HEIGHT", 480)
-        self.max_dets = getattr(config, "MAX_DETECTIONS_PER_CAMERA", 16)
+        self.max_dets = getattr(config, "MAX_DETECTIONS_PER_CAMERA", 18)
 
         self.use_gpu = bool(getattr(config, "USE_GPU", True)) and torch.cuda.is_available()
         self.device = torch.device("cuda:0" if self.use_gpu else "cpu")
         self.use_cuda_graphs = bool(getattr(config, "USE_CUDA_GRAPHS", True)) and self.use_gpu
         self._dtype = torch.float16 if self.use_gpu else torch.float32
 
-        self.conf_low = getattr(config, "YOLO_CONF_LOW", 0.28)
-        self.iou_thresh = getattr(config, "YOLO_IOU_THRESHOLD", 0.44)
+        self.conf_low = getattr(config, "YOLO_CONF_LOW", 0.35)
+        self.iou_thresh = getattr(config, "YOLO_IOU_THRESHOLD", 0.50)
 
         self.min_w = float(getattr(config, "MIN_BOX_WIDTH", 16))
-        self.min_h = float(getattr(config, "MIN_BOX_HEIGHT", 32))
-        self.min_ar = float(getattr(config, "MIN_ASPECT_RATIO", 0.15))
-        self.max_ar = float(getattr(config, "MAX_ASPECT_RATIO", 2.80))
+        self.min_h = float(getattr(config, "MIN_BOX_HEIGHT", 34))
+        self.min_ar = float(getattr(config, "MIN_ASPECT_RATIO", 0.18))
+        self.max_ar = float(getattr(config, "MAX_ASPECT_RATIO", 0.95))
 
         self._lock = threading.Lock()
         self._stream = torch.cuda.Stream(device=self.device) if self.use_gpu else None
 
-        # Load and fuse YOLO model on the selected device while preserving the one2many head for crowd recall
+        # Load and fuse YOLO26n model (uses the clean one2one inference head)
         yolo = YOLO(self.config.YOLO_MODEL_PATH, task="detect", verbose=False)
-        raw_head = yolo.model.model[-1]
-        cv2_o2m = getattr(raw_head, "cv2", None)
-        cv3_o2m = getattr(raw_head, "cv3", None)
-        if cv2_o2m is not None and cv3_o2m is not None:
-            for mod_list in (cv2_o2m, cv3_o2m):
-                for sub_m in mod_list.modules():
-                    if hasattr(sub_m, "fuse"):
-                        sub_m.fuse()
-
-        if self.use_gpu:
-            dummy = torch.zeros((1, 3, self.height, self.width), device=self.device, dtype=torch.float16)
-            yolo.predict(dummy, device=self.device, half=True, verbose=False)
-            self.net = yolo.model.to(self.device).eval().half()
-        else:
-            dummy = torch.zeros((1, 3, self.height, self.width), device=self.device, dtype=torch.float32)
-            yolo.predict(dummy, device="cpu", half=False, verbose=False)
-            self.net = yolo.model.to(self.device).eval().float()
+        dummy = torch.zeros((1, 3, self.height, self.width), device=self.device, dtype=self._dtype)
+        yolo.predict(dummy, device=self.device, half=self.use_gpu, verbose=False)
+        self.net = yolo.model.to(self.device, dtype=self._dtype).eval()
 
         head = self.net.model[-1]
-        if cv2_o2m is not None and cv3_o2m is not None:
-            head.cv2 = cv2_o2m.to(self.device).eval()
-            head.cv3 = cv3_o2m.to(self.device).eval()
-            if self.use_gpu:
-                head.cv2.half()
-                head.cv3.half()
-            else:
-                head.cv2.float()
-                head.cv3.float()
-
         max_dets = self.max_dets
         nc = head.nc
-        has_dual_head = bool(getattr(head, "end2end", False)) and (head.cv2 is not None) and (head.cv3 is not None)
 
-        if has_dual_head:
-            def _dual_head_person_forward(x: list[torch.Tensor]):
-                o2o_raw = head.forward_head(x, **head.one2one)
-                o2m_raw = head.forward_head(x, **head.one2many)
-                o2o = head._inference(o2o_raw).permute(0, 2, 1)  # (B, N, 4 + nc)
-                o2m = head._inference(o2m_raw).permute(0, 2, 1)  # (B, N, 4 + nc)
+        def _person_only_postprocess(preds: torch.Tensor) -> torch.Tensor:
+            boxes, scores = preds.split([4, nc], dim=-1)
+            person_scores = scores[..., 0:1]
+            other_max = scores[..., 1:].amax(dim=-1, keepdim=True)
+            # Suppress anchors with chair/couch/furniture activation (COCO classes 56..62)
+            furniture_max = scores[..., 56:63].amax(dim=-1, keepdim=True)
+            is_valid_person = (person_scores >= other_max * 1.6) & (
+                (furniture_max <= 0.08) | (person_scores >= 0.75)
+            )
+            person_scores = torch.where(is_valid_person, person_scores, torch.zeros_like(person_scores))
 
-                b_o2o, sc_o2o = o2o.split([4, nc], dim=-1)
-                b_o2m, sc_o2m = o2m.split([4, nc], dim=-1)
+            top_scores, idx = person_scores.topk(max_dets, dim=1)
+            top_boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
+            return torch.cat([top_boxes, top_scores, torch.zeros_like(top_scores)], dim=-1)
 
-                p_o2o = sc_o2o[..., 0:1]
-                other_o2o = sc_o2o[..., 1:].amax(dim=-1, keepdim=True)
-                p_o2o = torch.where(p_o2o >= other_o2o * 0.75, p_o2o, torch.zeros_like(p_o2o))
+        head.postprocess = _person_only_postprocess
 
-                p_o2m = sc_o2m[..., 0:1]
-                other_o2m = sc_o2m[..., 1:].amax(dim=-1, keepdim=True)
-                p_o2m = torch.where(p_o2m >= other_o2m * 0.80, p_o2m, torch.zeros_like(p_o2m))
-
-                # 3x3 spatial peak selection on one2many per FPN level to recover close/occluded people
-                bsz = p_o2m.shape[0]
-                peak_masks = []
-                offset = 0
-                for feat in o2m_raw["feats"]:
-                    fh, fw = feat.shape[-2], feat.shape[-1]
-                    flen = fh * fw
-                    s_lvl = p_o2m[:, offset : offset + flen, 0].view(bsz, 1, fh, fw)
-                    pk = (s_lvl == F.max_pool2d(s_lvl, 3, stride=1, padding=1)).view(bsz, flen, 1)
-                    peak_masks.append(pk)
-                    offset += flen
-                peak_mask = torch.cat(peak_masks, dim=1)
-                p_o2m_peak = torch.where(peak_mask, p_o2m * 0.92, torch.zeros_like(p_o2m))
-
-                use_o2m = p_o2m_peak > p_o2o
-                best_scores = torch.where(use_o2m, p_o2m_peak, p_o2o)
-                best_boxes = torch.where(use_o2m.expand(-1, -1, 4), b_o2m, b_o2o)
-
-                top_scores, idx = best_scores.topk(max_dets, dim=1)
-                top_boxes = best_boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
-                cls_zero = torch.zeros_like(top_scores)
-                out = torch.cat([top_boxes, top_scores, cls_zero], dim=-1)
-                return (out, o2o_raw)
-
-            head.forward = _dual_head_person_forward
-        else:
-            def _person_only_postprocess(preds: torch.Tensor) -> torch.Tensor:
-                boxes, scores = preds.split([4, nc], dim=-1)
-                person_scores = scores[..., 0:1]
-                other_max = scores[..., 1:].amax(dim=-1, keepdim=True)
-                person_scores = torch.where(
-                    person_scores >= other_max * 0.75, person_scores, torch.zeros_like(person_scores)
-                )
-                top_scores, idx = person_scores.topk(max_dets, dim=1)
-                top_boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
-                cls_zero = torch.zeros_like(top_scores)
-                return torch.cat([top_boxes, top_scores, cls_zero], dim=-1)
-
-            head.postprocess = _person_only_postprocess
-
-        # Load MobileNetV3-Small Re-ID backbone split into mid-level (layer 8) and deep (layer 12)
-        self.backbone = models.mobilenet_v3_small(
-            weights=models.MobileNet_V3_Small_Weights.DEFAULT
-        ).features.to(self.device).eval()
-        if self.use_gpu:
-            self.backbone.half()
-        else:
-            self.backbone.float()
-
+        # Torchvision MobileNetV3-Small Re-ID backbone
+        self.backbone = (
+            models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+            .features.to(self.device, dtype=self._dtype)
+            .eval()
+        )
         self.backbone_mid = self.backbone[:9]
         self.backbone_deep = self.backbone[9:]
-
         self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device, dtype=self._dtype).view(1, 3, 1, 1)
         self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device, dtype=self._dtype).view(1, 3, 1, 1)
 
         self._slots: dict[int, _GraphSlot] = {}
         logging.info(
             f"[BatchInferenceEngine] Inicializado em {self.device} "
-            f"(USE_GPU={self.use_gpu}, FP16={self.use_gpu}, CUDAGraphs={self.use_cuda_graphs})"
+            f"(USE_GPU={self.use_gpu}, CUDAGraphs={self.use_cuda_graphs})"
         )
 
-    def _build_slot(self, batch_size: int) -> _GraphSlot:
+    def _get_slot(self, batch_size: int) -> _GraphSlot:
+        slot = self._slots.get(batch_size)
+        if slot is not None:
+            return slot
+
         slot = _GraphSlot(batch_size, self.height, self.width, self.max_dets, self.device, self._dtype)
         dtype = self._dtype
 
         def _forward_pass():
             t_rgb = slot.static_bgr.flip(-1).permute(0, 3, 1, 2).contiguous().to(dtype).div_(255.0)
-            preds = self.net(t_rgb)[0]  # (B, max_dets, 6)
-            b_x1 = preds[..., 0:1].clamp(0.0, float(self.width))
-            b_y1 = preds[..., 1:2].clamp(0.0, float(self.height))
-            b_x2 = preds[..., 2:3].clamp(0.0, float(self.width))
-            b_y2 = preds[..., 3:4].clamp(0.0, float(self.height))
-            clamped_boxes = torch.cat([b_x1, b_y1, b_x2, b_y2], dim=-1).to(dtype)
+            preds = self.net(t_rgb)[0]
+            clamped_boxes = torch.cat(
+                [
+                    preds[..., 0:1].clamp(0.0, float(self.width)),
+                    preds[..., 1:2].clamp(0.0, float(self.height)),
+                    preds[..., 2:3].clamp(0.0, float(self.width)),
+                    preds[..., 3:4].clamp(0.0, float(self.height)),
+                ],
+                dim=-1,
+            ).to(dtype)
             rois = torch.cat([slot.batch_idx_static, clamped_boxes], dim=-1).reshape(-1, 5)
             crops = roi_align(t_rgb, rois, output_size=(128, 64), spatial_scale=1.0, aligned=True)
 
@@ -225,7 +151,7 @@ class BatchInferenceEngine:
             mid_map = self.backbone_mid(crops_norm)
             deep_map = self.backbone_deep(mid_map)
             feats = extract_multistripe_embeddings_from_maps(crops, mid_map, deep_map).view(
-                batch_size, self.max_dets, 576
+                batch_size, self.max_dets, EMBEDDING_DIM
             )
             return preds.float(), feats.float()
 
@@ -241,26 +167,15 @@ class BatchInferenceEngine:
             with torch.cuda.graph(slot.graph, stream=self._stream), torch.inference_mode():
                 slot.out_dets, slot.out_feats = _forward_pass()
             torch.cuda.synchronize()
-            logging.info(f"[BatchInferenceEngine] CUDA Graph capturado para batch_size={batch_size} câmaras.")
         else:
             slot._eager_fn = _forward_pass
 
         self._slots[batch_size] = slot
         return slot
 
-    def _get_slot(self, batch_size: int) -> _GraphSlot:
-        slot = self._slots.get(batch_size)
-        if slot is None:
-            slot = self._build_slot(batch_size)
-        return slot
-
     @torch.inference_mode()
     def launch_async(self, frames: list[np.ndarray], buf_idx: int = 0) -> tuple[_GraphSlot, int]:
-        """
-        Copy frames into host buffer and launch inference on GPU (CUDA Graph or stream) or CPU.
-        """
-        b = len(frames)
-        slot = self._get_slot(b)
+        slot = self._get_slot(len(frames))
         p_in = slot.pinned_in[buf_idx]
         for i, frame in enumerate(frames):
             p_in[i].copy_(torch.from_numpy(frame))
@@ -278,7 +193,6 @@ class BatchInferenceEngine:
                 slot.pinned_dets[buf_idx].copy_(dets, non_blocking=True)
                 slot.pinned_feats[buf_idx].copy_(feats, non_blocking=True)
         else:
-            # CPU execution path
             slot.static_bgr.copy_(p_in)
             dets, feats = slot._eager_fn()
             slot.pinned_dets[buf_idx].copy_(dets)
@@ -289,18 +203,12 @@ class BatchInferenceEngine:
     def synchronize_and_filter(
         self, slot: _GraphSlot, buf_idx: int
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """
-        Wait for the GPU stream (if active) to complete and return filtered
-        (boxes_xyxy, confs, feats) per camera in the batch.
-        Applies geometric human box validation and scale-aware intra-class NMS.
-        """
         if self._stream is not None:
             self._stream.synchronize()
 
         dets_batch = slot.pinned_dets[buf_idx].numpy()
         feats_batch = slot.pinned_feats[buf_idx].numpy()
         frame_area = float(self.width * self.height)
-        max_area = frame_area * 0.65
 
         results_per_cam: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         for c in range(slot.batch_size):
@@ -313,14 +221,10 @@ class BatchInferenceEngine:
             y2 = np.clip(c_dets[:, 3], 0.0, self.height)
             confs = c_dets[:, 4]
 
-            w = x2 - x1
-            h = y2 - y1
+            w, h = x2 - x1, y2 - y1
             ar = w / np.maximum(1.0, h)
             area = w * h
-            lens_occlusion = (h >= self.height * 0.96) & (area >= frame_area * 0.45)
-
-            # Reject narrow edge slivers (e.g. half an arm/shoulder cut off by image boundary)
-            edge_sliver = ((x1 <= 3.0) | (x2 >= self.width - 3.0)) & (w < 20.0) & (confs < 0.55)
+            edge_sliver = ((x1 <= 3.0) | (x2 >= self.width - 3.0)) & (w < 22.0) & (confs < 0.58)
 
             valid = (
                 (confs >= self.conf_low)
@@ -328,8 +232,7 @@ class BatchInferenceEngine:
                 & (h >= self.min_h)
                 & (ar >= self.min_ar)
                 & (ar <= self.max_ar)
-                & (area <= max_area)
-                & (~lens_occlusion)
+                & (area <= frame_area * 0.60)
                 & (~edge_sliver)
             )
 
@@ -337,7 +240,7 @@ class BatchInferenceEngine:
                 results_per_cam.append((
                     np.empty((0, 4), dtype=np.float32),
                     np.empty((0,), dtype=np.float32),
-                    np.empty((0, 576), dtype=np.float32),
+                    np.empty((0, EMBEDDING_DIM), dtype=np.float32),
                 ))
                 continue
 
@@ -345,80 +248,51 @@ class BatchInferenceEngine:
             v_confs = confs[valid].astype(np.float32)
             v_feats = c_feats[valid].copy()
 
-            # Crowd-aware intra-class NMS with part-box suppression
             if len(v_boxes) > 1:
-                keep = self._nms_cpu(v_boxes, v_confs, self.iou_thresh)
-                v_boxes = v_boxes[keep]
-                v_confs = v_confs[keep]
-                v_feats = v_feats[keep]
+                keep = self._filter_boxes_torchvision(v_boxes, v_confs)
+                v_boxes, v_confs, v_feats = v_boxes[keep], v_confs[keep], v_feats[keep]
 
             results_per_cam.append((v_boxes, v_confs, v_feats))
 
         return results_per_cam
 
-    @staticmethod
-    def _nms_cpu(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
-        """
-        Crowd-aware greedy NMS for person detections:
-        - Preserves distinct people standing close together or partially occluded (IoU <= iou_threshold).
-        - Suppresses duplicate anchor predictions on the exact same person center.
-        - Suppresses true partial-body sub-boxes (e.g. head/torso box inside full-body box on the same vertical axis)
-          without suppressing a second person standing beside or behind a foreground person.
-        """
-        order = scores.argsort()[::-1]
-        keep = []
-        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-        w_all = np.maximum(1.0, x2 - x1)
-        h_all = np.maximum(1.0, y2 - y1)
-        cx_all = x1 + 0.5 * w_all
-        cy_all = y1 + 0.5 * h_all
-        areas = w_all * h_all
+    def _filter_boxes_torchvision(self, boxes: np.ndarray, scores: np.ndarray) -> np.ndarray:
+        """Apply Torchvision C++ `nms` and suppress contained partial-body sub-boxes."""
+        boxes_t = torch.from_numpy(boxes)
+        scores_t = torch.from_numpy(scores)
+        keep_idx = nms(boxes_t, scores_t, self.iou_thresh)
+        if len(keep_idx) <= 1:
+            return keep_idx.numpy()
 
-        while order.size > 0:
-            i = int(order[0])
-            keep.append(i)
-            if order.size == 1:
-                break
-            rest = order[1:]
-            xx1 = np.maximum(x1[i], x1[rest])
-            yy1 = np.maximum(y1[i], y1[rest])
-            xx2 = np.minimum(x2[i], x2[rest])
-            yy2 = np.minimum(y2[i], y2[rest])
-            w = np.maximum(0.0, xx2 - xx1)
-            h = np.maximum(0.0, yy2 - yy1)
-            inter = w * h
-            iou = inter / (areas[i] + areas[rest] - inter)
-            io_min = inter / np.minimum(areas[i], areas[rest])
+        b = boxes_t[keep_idx]
+        s = scores_t[keep_idx]
+        w = (b[:, 2] - b[:, 0]).clamp(min=1.0)
+        h = (b[:, 3] - b[:, 1]).clamp(min=1.0)
+        cx = 0.5 * (b[:, 0] + b[:, 2])
+        areas = w * h
 
-            max_w = np.maximum(w_all[i], w_all[rest])
-            max_h = np.maximum(h_all[i], h_all[rest])
-            dx_norm = np.abs(cx_all[i] - cx_all[rest]) / max_w
-            dy_norm = np.abs(cy_all[i] - cy_all[rest]) / max_h
-            scale_ratio = np.minimum(h_all[i], h_all[rest]) / max_h
-            top_aligned = np.abs(y1[i] - y1[rest]) < (0.12 * max_h)
+        inter_tl = torch.maximum(b[:, None, :2], b[None, :, :2])
+        inter_br = torch.minimum(b[:, None, 2:], b[None, :, 2:])
+        inter_wh = (inter_br - inter_tl).clamp(min=0.0)
+        inter_area = inter_wh[:, :, 0] * inter_wh[:, :, 1]
+        io_min = inter_area / torch.minimum(areas[:, None], areas[None, :])
+        iou = box_iou(b, b)
 
-            # 1) Duplicate prediction on the exact same person center (e.g. one2one + one2many anchor pair)
-            same_center_dup = (iou > 0.44) & (dx_norm < 0.15) & (dy_norm < 0.15) & (scale_ratio > 0.78)
+        lower_rank = torch.triu(torch.ones((len(b), len(b)), dtype=torch.bool), diagonal=1)
+        dx_norm = torch.abs(cx[:, None] - cx[None, :]) / torch.maximum(w[:, None], w[None, :])
+        scale_ratio = torch.minimum(h[:, None], h[None, :]) / torch.maximum(h[:, None], h[None, :])
 
-            # 2) True partial-body sub-box (significantly shorter box contained inside full-body box on same column)
-            is_subpart = (
-                (scale_ratio < 0.72)
-                & (io_min > 0.84)
-                & (dx_norm < 0.20)
-                & ((scores[rest] < 0.52) | top_aligned)
-            )
-            suppress = (iou > iou_threshold) | same_center_dup | is_subpart
-            order = rest[~suppress]
-        return keep
+        same_center_dup = lower_rank & (iou > 0.44) & (dx_norm < 0.15) & (scale_ratio > 0.78)
+        subpart_dup = lower_rank & (io_min > 0.84) & (scale_ratio < 0.72) & (dx_norm < 0.20) & (s[None, :] < 0.55)
+        suppressed = (same_center_dup | subpart_dup).any(dim=0)
+        return keep_idx[~suppressed].numpy()
 
     def infer_batch(self, frames: list[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Synchronous convenience wrapper for single-step batch inference."""
         with self._lock:
             slot, buf_idx = self.launch_async(frames, buf_idx=0)
             return self.synchronize_and_filter(slot, buf_idx)
 
     def cleanup(self) -> None:
-        """Synchronize CUDA stream and release captured CUDA Graphs cleanly before exit."""
         try:
             if self._stream is not None:
                 self._stream.synchronize()

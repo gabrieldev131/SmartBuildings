@@ -1,9 +1,9 @@
 # extraction/FrameReaderManagement.py
 """
-Application Orchestrator (Facade Pattern).
-Coordinates camera command factories, asynchronous frame readers, the Unified Batched
-CUDA-Graph Inference Engine, per-camera VectorizedDeepSort workers, Cross-Camera
-GlobalIdentityManager, and the MultiCameraDisplay presenter.
+Application Orchestrator.
+Coordinates asynchronous camera readers (`FrameReaderInvoker`), double-buffered batched
+GPU inference (`BatchInferenceEngine`), per-camera `deep-sort-realtime` trackers (`CameraWorker`),
+cross-camera `GlobalIdentityManager`, and OpenCV display (`MultiCameraDisplay`).
 """
 import logging
 import multiprocessing as mp
@@ -13,7 +13,7 @@ import time
 from core.GlobalIdentityManager import GlobalIdentityManager
 from core.IdentityManagerServer import IdentityManagerServer
 from extraction.CameraProcess import run_camera_process
-from extraction.frameReaderCommand.CommandFactories import RTSPCommandFactory, KafkaCommandFactory
+from extraction.frameReaderCommand.CommandFactories import KafkaCommandFactory, RTSPCommandFactory
 from extraction.frameReaderCommand.FrameReaderInvoker import FrameReaderInvoker
 from ui.display import MultiCameraDisplay
 from vision.BatchInferenceEngine import BatchInferenceEngine
@@ -21,17 +21,7 @@ from vision.cameraWorker import CameraWorker
 
 
 class FrameReaderManagement:
-    """
-    Central system orchestrator supporting two execution strategies configurable via Config.EXECUTION_MODE:
-    1) "batched" (Default, High Performance):
-       - Runs one dedicated I/O FrameReaderInvoker thread per camera source.
-       - Runs a single centralized BatchInferenceEngine on GPU with captured CUDA Graphs & FP16.
-       - Uses Double-Buffered Software Pipelining (GPU executes Batch t while CPU tracks Batch t-1),
-         delivering 60-100+ FPS per camera across up to 8 cameras on an RTX 2080 Ti.
-       - Shares GlobalIdentityManager directly in-memory with zero socket/pickle IPC overhead.
-    2) "multiprocess" (Legacy Distributed Mode):
-       - Spawns one OS process per camera communicating via IdentityManagerServer (BaseManager).
-    """
+    """Central orchestrator supporting 'batched' (default) and 'multiprocess' execution modes."""
 
     def __init__(self, config):
         self.config = config
@@ -43,27 +33,13 @@ class FrameReaderManagement:
         self.global_manager = None
 
     def _camera_factories(self):
-        """
-        Configure all active camera sources here.
-        Add up to 8 (or more) RTSPCommandFactory or KafkaCommandFactory entries.
-        """
+        """Configure active video sources (RTSP, local video files, or Kafka)."""
         w = self.config.PROCESSING_WIDTH
         h = self.config.PROCESSING_HEIGHT
-        #loop = getattr(self.config, "LOOP_LOCAL_VIDEOS", True)
-        #pace = getattr(self.config, "VIDEO_FILE_REALTIME_PACING", False)
         kafka_bootstrap = getattr(self.config, "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
         return [
-            #RTSPCommandFactory(
-            #    source="rtsp://admin:Aluno@00@10.145.80.52:554",
-            #    width=w,
-            #    height=h,
-            #    cam_id="cam_1",
-            #    loop_video=loop,
-            #    pace_fps=pace,
-            #),
-            # Example local video or additional RTSP cameras (uncomment to scale up to 8 cameras):
-            # RTSPCommandFactory(source="models/pessoas.mp4", width=w, height=h, cam_id="cam_2", loop_video=loop, pace_fps=pace),
+            # RTSPCommandFactory(source="testes/pessoas.mp4", width=w, height=h, cam_id="cam_1"),
             KafkaCommandFactory(
                 bootstrap_servers=kafka_bootstrap,
                 topic=self.config.KAFKA_TOPIC,
@@ -83,22 +59,17 @@ class FrameReaderManagement:
         else:
             self._run_batched_pipeline_mode()
 
-    # =========================================================================
-    # MODE 1: HIGH-PERFORMANCE BATCHED GPU + DOUBLE-BUFFERED PIPELINE (60+ FPS)
-    # =========================================================================
     def _run_batched_pipeline_mode(self) -> None:
         self.global_manager = GlobalIdentityManager(self.config)
         engine = BatchInferenceEngine(self.config)
         display = MultiCameraDisplay(self.config)
         workers: dict[str, CameraWorker] = {}
 
-        factories = self._camera_factories()
-        for idx, factory in enumerate(factories):
-            cmd = factory()
+        for idx, factory in enumerate(self._camera_factories()):
             reader_name = f"CameraReader-{idx}"
             invoker = FrameReaderInvoker(
                 cam_key=reader_name,
-                command=cmd,
+                command=factory(),
                 stop_event=self.local_stop,
                 name=reader_name,
             )
@@ -106,10 +77,9 @@ class FrameReaderManagement:
             self.readers.append(invoker)
             logging.info(f"Leitor assíncrono '{reader_name}' iniciado.")
 
-        # Wait briefly for initial frames from active cameras
         self._wait_for_initial_frames(timeout=3.0)
 
-        prev_batch_state = None  # Holds (cam_ids, frames_list, det_results, batch_timestamp, new_cams)
+        prev_batch_state = None
         step_idx = 0
 
         def _process_and_render(batch_state) -> bool:
@@ -126,7 +96,7 @@ class FrameReaderManagement:
                         inference_engine=engine,
                     )
                 boxes_xyxy, confs, feats = p_det_results[c_idx]
-                out_frame = workers[cid].process_detections(
+                rendered_dict[cid] = workers[cid].process_detections(
                     frame=p_frames[c_idx],
                     boxes_xyxy=boxes_xyxy,
                     confs=confs,
@@ -134,7 +104,6 @@ class FrameReaderManagement:
                     current_time=p_ts,
                     is_new_frame=(is_first or (cid in p_new_cams)),
                 )
-                rendered_dict[cid] = out_frame
 
             if not display.render(rendered_dict):
                 self.local_stop.set()
@@ -158,15 +127,15 @@ class FrameReaderManagement:
                 buf_idx = step_idx % 2
                 now_wall = time.time()
 
-                # 1. Asynchronously launch GPU inference (YOLO + ROI-Align + Re-ID CUDA Graph) for Batch t
+                # 1. Launch GPU inference for Batch t (CUDA Graph / async stream)
                 curr_slot, curr_buf = engine.launch_async(frames_list, buf_idx=buf_idx)
 
-                # 2. While GPU hardware executes Batch t, CPU processes tracking & annotations for Batch t-1
+                # 2. Overlap CPU DeepSort tracking & rendering for Batch t-1
                 if prev_batch_state is not None:
                     if not _process_and_render(prev_batch_state):
                         break
 
-                # 3. Synchronize GPU stream for Batch t and stage its results for next iteration's CPU step
+                # 3. Synchronize GPU stream for Batch t
                 det_results = engine.synchronize_and_filter(curr_slot, curr_buf)
                 prev_batch_state = (cam_ids, frames_list, det_results, now_wall, new_cams)
                 step_idx += 1
@@ -206,10 +175,9 @@ class FrameReaderManagement:
 
         for r in self.readers:
             cached_dict, r_new_cams = r.get_batch_state()
-            if not cached_dict:
-                continue
-            frames_by_cam.update(cached_dict)
-            new_cams.update(r_new_cams)
+            if cached_dict:
+                frames_by_cam.update(cached_dict)
+                new_cams.update(r_new_cams)
 
         if not frames_by_cam:
             return [], [], set()
@@ -218,22 +186,12 @@ class FrameReaderManagement:
         frames_list = [frames_by_cam[cid] for cid in cam_ids]
         return cam_ids, frames_list, new_cams
 
-    # =========================================================================
-    # MODE 2: LEGACY MULTIPROCESS MODE (1 OS Process Per Camera)
-    # =========================================================================
     def _run_multiprocess_mode(self) -> None:
-        self._start_identity_server()
-        self._start_camera_processes()
-        self._wait_for_processes()
-        self._shutdown_multiprocess()
-
-    def _start_identity_server(self) -> None:
         self.manager = IdentityManagerServer(authkey=b"smartbuilds-reid")
         self.manager.start()
         self.global_manager = self.manager.GlobalIdentityManager(self.config)
         logging.info("Servidor de identidades globais iniciado.")
 
-    def _start_camera_processes(self) -> None:
         for idx, factory in enumerate(self._camera_factories()):
             proc_name = f"CameraProc-{idx}"
             p = mp.Process(
@@ -245,25 +203,18 @@ class FrameReaderManagement:
             self.processes.append(p)
             logging.info(f"Processo '{proc_name}' iniciado (pid={p.pid}).")
 
-    def _wait_for_processes(self) -> None:
         try:
             while any(p.is_alive() for p in self.processes):
                 for p in self.processes:
                     p.join(timeout=0.5)
         except KeyboardInterrupt:
-            logging.info("Interrupção manual (Ctrl+C). Encerrando todos os processos...")
-
-    def _shutdown_multiprocess(self) -> None:
-        logging.info("A iniciar rotina de encerramento seguro...")
-        self.stop_event.set()
-
-        for p in self.processes:
-            p.join(timeout=5.0)
-            if p.is_alive():
-                logging.warning(f"Processo '{p.name}' não encerrou a tempo, finalizando à força.")
-                p.terminate()
-
-        logging.info("A exportar dados para CSV...")
-        self.global_manager.export_data_to_csv("tracking_data_final.csv")
-        self.manager.shutdown()
-        logging.info("Programa finalizado com sucesso.")
+            logging.info("Interrupção manual (Ctrl+C). Encerrando processos...")
+        finally:
+            self.stop_event.set()
+            for p in self.processes:
+                p.join(timeout=5.0)
+                if p.is_alive():
+                    p.terminate()
+            self.global_manager.export_data_to_csv("tracking_data_final.csv")
+            self.manager.shutdown()
+            logging.info("Programa finalizado com sucesso.")

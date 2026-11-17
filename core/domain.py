@@ -54,11 +54,38 @@ class FramePacket:
 
 
 @dataclass(slots=True)
-class TrackedPerson:
-    """Domain Entity representing an active person track resolved to a Global Identity."""
-    local_id: int
+class TrackContext:
+    """
+    Context passed to each `IBehaviorAnalyzer` plugin on every frame for a tracked person.
+    """
     global_id: int
+    local_id: int
+    cam_id: str
+    bbox: list[float]          # [x1, y1, x2, y2]
+    current_time: float
+    confidence: float = 1.0
+
+
+@dataclass(slots=True)
+class BehaviorResult:
+    """
+    Standardized output returned by an `IBehaviorAnalyzer` plugin.
+    Allows new functionalities to control HUD labels, box colors, and CSV event logging
+    without modifying `CameraWorker`, `display.py`, or `GlobalIdentityManager`.
+    """
+    name: str                                          # Unique analyzer key (e.g., "stopped", "zone_alert")
+    is_active: bool = False                            # Whether the behavior/alert is currently active
+    label_suffix: str = ""                             # Text appended to the person's HUD label (e.g., "PARADO 5s")
+    color_override: Optional[tuple[int, int, int]] = None  # BGR box color when active (e.g., (0, 0, 255))
+    event_type: Optional[str] = None                   # CSV event_type when active (e.g., "PERSON_STOPPED")
+    duration_seconds: float = 0.0                      # Duration of the active behavior/episode
+    details: str = ""                                  # Human-readable description for CSV export
+
+
+@dataclass(slots=True)
+class AnnotationSpec:
+    """Visual specification for rendering a tracked person on the HUD."""
     bbox: list[float]
-    confidence: float
-    is_stopped: bool
-    stopped_elapsed: float
+    global_id: int
+    label: str
+    color: tuple[int, int, int]
