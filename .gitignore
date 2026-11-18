@@ -153,6 +153,7 @@ venv.bak/
 
 # mkdocs documentation
 /site
+JrtipArticleStructure.md
 
 # mypy
 .mypy_cache/

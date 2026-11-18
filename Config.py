@@ -14,9 +14,9 @@ class Config:
 
     # === YOLO DETECTION PARAMETERS (ultralytics + torchvision) ===
     YOLO_MODEL_PATH = "models/yolo26n.pt"
-    YOLO_CONF_THRESHOLD = 0.42       # Confidence threshold for person tracking
-    YOLO_INIT_CONF = 0.50            # Minimum confidence required to initiate a brand-new person track
-    YOLO_CONF_LOW = 0.35             # Minimum confidence kept after GPU post-processing
+    YOLO_CONF_THRESHOLD = 0.40       # Confidence threshold for person tracking
+    YOLO_INIT_CONF = 0.48            # Minimum confidence required to confirm a brand-new person track
+    YOLO_CONF_LOW = 0.34             # Minimum confidence kept after GPU post-processing
     YOLO_IOU_THRESHOLD = 0.50        # Torchvision NMS IoU threshold
 
     # Geometric human bounding-box validation (rejects chairs, tables, and wide non-human objects)
@@ -26,33 +26,38 @@ class Config:
     MAX_ASPECT_RATIO = 0.95          # max (width / height) - humans are taller than wide
 
     # === DEEPSORT TRACKING PARAMETERS (deep-sort-realtime) ===
-    DEEPSORT_MAX_AGE = 75            # Max missed frames before a local track is deleted
-    DEEPSORT_N_INIT = 3              # Consecutive hits required to confirm a tentative track
+    DEEPSORT_MAX_AGE = 90            # Max missed frames before a local track is deleted
+    DEEPSORT_N_INIT = 2              # Consecutive hits required to confirm a tentative track
     DEEPSORT_NMS_MAX_OVERLAP = 0.75  # NMS overlap threshold inside DeepSort
-    DEEPSORT_MAX_COSINE_DISTANCE = 0.38
+    DEEPSORT_MAX_COSINE_DISTANCE = 0.40
     DEEPSORT_MAX_IOU_DISTANCE = 0.72
     DEEPSORT_NN_BUDGET = 35          # Bounded appearance gallery per local track
-    DEEPSORT_MAX_COAST_FRAMES = 2    # Max frames to render damped prediction during brief detector blink
+    DEEPSORT_MAX_COAST_FRAMES = 3    # Max frames to render damped prediction during brief detector blink
     DEEPSORT_BOX_SMOOTH_ALPHA = 0.65
 
-    # === DECOUPLED BEHAVIOR PLUGINS (Strategy + Composite Pattern) ===
-    ENABLE_STOPPED_DETECTION = True
+    # === DECOUPLED BEHAVIOR PLUGINS (Registry Pattern in behaviors/) ===
+    # Add any registered plugin key here (e.g., "stopped", "restricted_zone") - zero if/else required!
+    ACTIVE_BEHAVIORS = ("stopped",)
     STOPPED_SECONDS_THRESHOLD = 3
     STOPPED_PIXEL_THRESHOLD = 15
     MOVEMENT_BREAKOUT_THRESHOLD = 30
-
-    ENABLE_RESTRICTED_ZONE = False
     RESTRICTED_ZONE_NORM = (0.0, 0.0, 0.25, 0.25)
 
     # === GLOBAL RE-ID & CLUSTERING THRESHOLDS ===
-    SIMILARITY_THRESHOLD = 0.30      # Intra-camera appearance cosine distance threshold
-    INTER_CAMERA_THRESHOLD = 0.28    # Cross-camera appearance cosine distance threshold
-    SIMULTANEOUS_INTER_CAMERA_THRESHOLD = 0.18
-    MAX_SPATIAL_DISTANCE = 160
+    SIMILARITY_THRESHOLD = 0.35      # Intra-camera appearance cosine distance threshold
+    INTER_CAMERA_THRESHOLD = 0.37    # Cross-camera appearance cosine distance threshold
+    SIMULTANEOUS_INTER_CAMERA_THRESHOLD = 0.30
+    MAX_SPATIAL_DISTANCE = 180
     MAX_TIME_LOST = 120.0
     CAMERA_SWITCH_COOLDOWN = 0.8
     AUTO_CLUSTER_TIME_THRESHOLD = 15.0
     FEATURE_UPDATE_INTERVAL = 3
+
+    # === DECOUPLED DATA EXPORTERS (Registry Pattern in exporters/) ===
+    # Add any registered exporter key here (e.g., ("csv",), ("csv", "kafka")) - zero if/else required!
+    ACTIVE_EXPORTERS = ("csv",)
+    EXPORT_CSV_FILENAME = "tracking_data_final.csv"
+    KAFKA_EVENTS_TOPIC = "smartbuildings-eventos"
 
     # === UI & PRESENTATION ===
     DISPLAY_ENABLED = True
@@ -62,7 +67,7 @@ class Config:
     COLOR_MOVING = (0, 255, 0)
     FONT_SCALE = 0.5
 
-    # === KAFKA STREAMING ===
+    # === KAFKA VIDEO STREAMING ===
     KAFKA_BOOTSTRAP_SERVERS = "10.145.80.61:9092"
     KAFKA_TOPIC = "meu-topico-de-video"
     KAFKA_GROUP_ID = "smart-builds-consumer"

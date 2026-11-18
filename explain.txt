@@ -1,654 +1,131 @@
 ================================================================================
 SMARTBUILDINGS MULTI-CAMERA VISION, TRACKING & RE-IDENTIFICATION SYSTEM
-COMPREHENSIVE TECHNICAL REFERENCE, BIBLIOGRAPHY & LINE-BY-LINE CODE EXPLANATION
+TECHNICAL ARCHITECTURE, S.O.L.I.D. DESIGN PATTERNS & MODULE REFERENCE
 File: explain.txt
 ================================================================================
 
-TABLE OF CONTENTS
------------------
-PART 1: ACADEMIC PAPERS, BOOKS & OFFICIAL DOCUMENTATION REFERENCES (BY MODULE)
-PART 2: LINE-BY-LINE EXPLANATION OF Config.py
-PART 3: LINE-BY-LINE EXPLANATION OF vision/featureExtractor.py
-PART 4: LINE-BY-LINE EXPLANATION OF vision/BatchInferenceEngine.py
-PART 5: LINE-BY-LINE EXPLANATION OF vision/VectorizedDeepSort.py
-PART 6: LINE-BY-LINE EXPLANATION OF vision/cameraWorker.py & vision/cameraWorker2.py
-PART 7: LINE-BY-LINE EXPLANATION OF core/GlobalIdentity.py
-PART 8: LINE-BY-LINE EXPLANATION OF core/GlobalIdentityManager.py
-PART 9: LINE-BY-LINE EXPLANATION OF core/ (CameraClusterManager, StoppedStateTracker, ports, IdentityManagerServer, runtime_setup)
-PART 10: LINE-BY-LINE EXPLANATION OF extraction/, ui/display.py, MarkovChain.py & main.py
-
-
-================================================================================
-PART 1: ACADEMIC PAPERS, BOOKS & OFFICIAL DOCUMENTATION REFERENCES
-================================================================================
-
-1. OBJECT DETECTION, DUAL-HEAD ASSIGNMENT & CROWD NMS (vision/BatchInferenceEngine.py)
---------------------------------------------------------------------------------------
-- [Paper - YOLOv10 / Dual Label Assignments (one2one + one2many)]
-  Wang, A., Chen, H., Liu, L., Chen, K., Lin, Z., Han, J., & Ding, G. (2024).
-  "YOLOv10: Real-Time End-to-End Object Detection."
-  Advances in Neural Information Processing Systems (NeurIPS 2024).
-  URL: https://arxiv.org/abs/2405.14458
-  * Used in `BatchInferenceEngine.__init__` and `_dual_head_person_forward` to combine the
-    NMS-free `one2one` head with the high-recall `one2many` head so people standing close
-    together in crowds are not suppressed by 1-to-1 anchor competition.
-
-- [Paper - CenterNet 3x3 Spatial Peak Pooling]
-  Zhou, X., Wang, D., & Krähenbühl, P. (2019).
-  "Objects as Points."
-  arXiv preprint arXiv:1904.07850.
-  URL: https://arxiv.org/abs/1904.07850
-  * Used in `_dual_head_person_forward` (`s_lvl == F.max_pool2d(s_lvl, 3, stride=1, padding=1)`)
-    to extract non-overlapping local spatial maxima per FPN feature level inside a static
-    CUDA Graph.
-
-- [Paper - RoIAlign (Sub-pixel Bilinear Region Feature Extraction)]
-  He, K., Gkioxari, G., Dollár, P., & Girshick, R. (2017).
-  "Mask R-CNN."
-  Proceedings of the IEEE International Conference on Computer Vision (ICCV), pp. 2961-2969.
-  URL: https://arxiv.org/abs/1703.06870
-  URL (PyTorch Docs): https://pytorch.org/vision/stable/generated/torchvision.ops.roi_align.html
-  * Used in `BatchInferenceEngine._build_slot` and `featureExtractor.extract_features_batch_from_frame`
-    to crop all detected people into (128, 64) tensors directly on the GPU without quantization error.
-
-- [Paper - CrowdHuman & Occlusion-Aware NMS]
-  Shao, S., Zhao, Z., Li, B., Xiao, T., Yu, G., Zhang, X., & Sun, J. (2018).
-  "CrowdHuman: A Benchmark for Detecting Human in a Crowd."
-  arXiv preprint arXiv:1805.00123.
-  URL: https://arxiv.org/abs/1805.00123
-  * Used in `BatchInferenceEngine._nms_cpu` to separate true partial-body sub-box artifacts
-    from distinct people standing close to or partially behind a foreground person.
-
-- [Official Documentation - Ultralytics YOLO26]
-  Ultralytics YOLO Documentation.
-  URL: https://docs.ultralytics.com/models/yolo26/
-  URL (GitHub): https://github.com/ultralytics/ultralytics
-
-
-2. PERSON RE-IDENTIFICATION (Re-ID) & COLOR CONSTANCY (vision/featureExtractor.py)
-----------------------------------------------------------------------------------
-- [Paper - MobileNetV3 Backbone]
-  Howard, A., Sandler, M., Chu, G., Chen, L. C., Chen, B., Tan, M., Wang, W., Zhu, Y.,
-  Pang, R., Vasudevan, V., Le, Q. V., & Adam, H. (2019).
-  "Searching for MobileNetV3."
-  Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), pp. 1314-1324.
-  URL: https://arxiv.org/abs/1905.02244
-  URL (Torchvision): https://pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html
-  * Used in `featureExtractor.py` and `BatchInferenceEngine.py` as the fast CNN feature backbone,
-    split at layer 9 (`_backbone_mid` for 8x4 clothing texture maps and `_backbone_deep` for
-    4x2 semantic maps).
-
-- [Paper - Part-Based Horizontal Stripe Pooling (PCB)]
-  Sun, Y., Zheng, L., Yang, Y., Tian, Q., & Wang, S. (2018).
-  "Beyond Part Models: Person Retrieval with Refined Part Pooling (and A Strong Convolutional Baseline)."
-  Proceedings of the European Conference on Computer Vision (ECCV), pp. 480-496.
-  URL: https://arxiv.org/abs/1711.09349
-  * Used in `extract_multistripe_embeddings_from_maps` to partition human crops horizontally
-    into head/shoulders, upper torso, lower torso/hips, and legs stripes.
-
-- [Paper - Mid-Level Texture + Deep Semantic Fusion for Re-ID]
-  Yu, Q., Chang, X., Song, Y. Z., Xiang, T., & Hospedales, T. M. (2017).
-  "The Devil is in the Middle: Exploiting Mid-level Representations for Cross-Domain Instance Matching."
-  arXiv preprint arXiv:1711.08106.
-  URL: https://arxiv.org/abs/1711.08106
-  * Used in `extract_multistripe_embeddings_from_maps` to fuse mid-level pattern/stripe descriptors
-    (`mid_part`) with deep semantic descriptors (`deep_part`).
-
-- [Paper - Multi-Scale Feature Learning for Re-ID (OSNet)]
-  Zhou, K., Yang, Y., Cavallaro, A., & Xiang, T. (2019).
-  "Omni-Scale Feature Learning for Person Re-Identification."
-  Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV), pp. 3702-3712.
-  URL: https://arxiv.org/abs/1905.00953
-  * Used in `extract_multistripe_embeddings_from_maps` to combine fine 8-stripe pooling with
-    coarse 4-stripe and 2-stripe pooling so camera angle/framing changes do not break stripe alignment.
-
-- [Paper - Gray-World Color Constancy & White Balance]
-  Buchsbaum, G. (1980).
-  "A spatial processor model for object colour perception."
-  Journal of the Franklin Institute, 310(1), 1-26.
-  URL: https://doi.org/10.1016/0016-0032(80)90058-7
-  * Used in `extract_multistripe_embeddings_from_maps` (`wb_body = body * (lum_mean / ch_mean)`)
-    to normalize per-crop RGB illumination and color temperature differences between cameras.
-
-- [Paper - Opponent Color Space & Illumination-Invariant Chromaticity]
-  Geusebroek, J. M., Van den Boomgaard, R., Smeulders, A. W., & Geerts, H. (2001).
-  "Color invariance."
-  IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI), 23(12), 1338-1350.
-  URL: https://doi.org/10.1109/34.977559
-  * Used in `extract_multistripe_embeddings_from_maps` to compute `rg = R - G`, `yb = 0.5*(R+G) - B`,
-    normalized chromaticity `(rn, gn, bn)`, and saturation `sat`.
-
-
-3. MULTI-OBJECT TRACKING, KALMAN FILTERING & BYTETRACK (vision/VectorizedDeepSort.py)
--------------------------------------------------------------------------------------
-- [Paper - DeepSORT]
-  Wojke, N., Bewley, A., & Paulus, D. (2017).
-  "Simple Online and Realtime Tracking with a Deep Association Metric."
-  2017 IEEE International Conference on Image Processing (ICIP), pp. 3645-3649.
-  URL: https://arxiv.org/abs/1703.07402
-  URL (Reference Repo): https://github.com/nwojke/deep_sort
-  * Foundation of `VectorizedDeepSort`: 8D Kalman filter state `[cx, cy, a, h, vx, vy, va, vh]`,
-    Mahalanobis gating (`CHI2_INV_95_4D = 9.4877`), and cosine appearance gallery matching.
-
-- [Paper - SORT (Simple Online and Realtime Tracking)]
-  Bewley, A., Ge, Z., Ott, L., Ramos, F., & Upcroft, B. (2016).
-  "Simple Online and Realtime Tracking."
-  2016 IEEE International Conference on Image Processing (ICIP), pp. 3464-3468.
-  URL: https://arxiv.org/abs/1602.00763
-
-- [Paper - ByteTrack (Two-Stage High/Low Confidence Detection Association)]
-  Zhang, Y., Sun, P., Jiang, Y., Yu, D., Weng, F., Yuan, Z., Luo, P., Liu, W., & Wang, X. (2022).
-  "ByteTrack: Multi-Object Tracking by Associating Every Detection Box."
-  Proceedings of the European Conference on Computer Vision (ECCV), pp. 1-21.
-  URL: https://arxiv.org/abs/2110.06864
-  * Used in `VectorizedDeepSort.update` (Stage B2) to associate low-confidence detections
-    (`conf_low <= conf < conf_high`) caused by partial occlusion in crowds.
-
-- [Paper - BoT-SORT (EMA Appearance Representation & Hybrid IoU-ReID Association)]
-  Aharon, N., Orfaig, R., & Bobrovsky, B. Z. (2022).
-  "BoT-SORT: Robust Associations Multi-Pedestrian Tracking."
-  arXiv preprint arXiv:2206.14651.
-  URL: https://arxiv.org/abs/2206.14651
-  * Used in `VectorizedTrack.update_appearance` and `GlobalIdentity.update` to combine an
-    Exponential Moving Average (`ema_feat`) with a bounded gallery and IoU-coupled cost matrix.
-
-- [Paper & Book - Kalman Filtering & Estimation Theory]
-  1) Welch, G., & Bishop, G. (1995). "An Introduction to the Kalman Filter."
-     UNC Chapel Hill Technical Report TR 95-041.
-     URL: https://www.cs.unc.edu/~welch/media/pdf/kalman_intro.pdf
-  2) Bar-Shalom, Y., Li, X. R., & Kirubarajan, T. (2001).
-     "Estimation with Applications to Tracking and Navigation: Theory, Algorithms and Software."
-     John Wiley & Sons. ISBN: 978-0-471-41655-5.
-
-- [Paper & Docs - Hungarian Algorithm (Linear Sum Assignment)]
-  Kuhn, H. W. (1955). "The Hungarian Method for the Assignment Problem."
-  Naval Research Logistics Quarterly, 2(1-2), 83-97.
-  URL (SciPy Docs): https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.linear_sum_assignment.html
-
-
-4. MULTI-CAMERA RE-ID, UNION-FIND CLUSTERING & MARKOV CHAINS (core/ & MarkovChain.py)
--------------------------------------------------------------------------------------
-- [Paper - Multi-Target Multi-Camera Tracking & Re-ID]
-  1) Ristani, E., & Tomasi, C. (2018).
-     "Features for Multi-Target Multi-Camera Tracking and Re-Identification."
-     Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pp. 6036-6046.
-     URL: https://arxiv.org/abs/1803.10859
-  2) Zheng, L., Yang, Y., & Hauptmann, A. G. (2016).
-     "Person Re-identification: Past, Present and Future."
-     arXiv preprint arXiv:1610.02984.
-     URL: https://arxiv.org/abs/1610.02984
-  * Used in `GlobalIdentityManager` and `GlobalIdentity` for cross-camera appearance scoring,
-    spatio-temporal transition validation, per-camera EMA memory, and online provisional ID
-    consolidation.
-
-- [Book & Paper - Disjoint-Set (Union-Find) Data Structure]
-  1) Cormen, T. H., Leiserson, C. E., Rivest, R. L., & Stein, C. (2022).
-     "Introduction to Algorithms" (4th ed., Chapter 19: Data Structures for Disjoint Sets).
-     MIT Press. ISBN: 978-0-262-04630-5.
-  2) Tarjan, R. E. (1975). "Efficiency of a Good But Not Linear Set Union Algorithm."
-     Journal of the ACM (JACM), 22(2), 215-225.
-  * Used in `core/CameraClusterManager.py` (`find` with path compression and `union` by root order)
-    to automatically merge cameras into spatial "Ambientes" when people transition between them.
-
-- [Book - Absorbing Markov Chains for Trajectory Analysis]
-  Kemeny, J. G., & Snell, J. L. (1960).
-  "Finite Markov Chains."
-  Springer-Verlag (Undergraduate Texts in Mathematics). ISBN: 978-0-387-90192-3.
-  URL (Grinstead & Snell Chapter 11): https://chance.dartmouth.edu/teaching_aids/books_articles/probability_book/Chapter11.pdf
-  * Used in `MarkovChain.py` to compute transition probability matrix $P$, submatrix $Q$,
-    fundamental matrix $N = (I - Q)^{-1}$, expected visit counts, and absorption probabilities $B = N R$.
-
-
-5. SOFTWARE ARCHITECTURE, DESIGN PATTERNS & GPU SYSTEMS ENGINEERING
--------------------------------------------------------------------
-- [Book - Clean Architecture & SOLID Principles]
-  Martin, R. C. (2017).
-  "Clean Architecture: A Craftsman's Guide to Software Structure and Design."
-  Prentice Hall. ISBN: 978-0-13-449416-6.
-  * Used in `core/ports.py` (`IFrameCommand`, `ICommandFactory`, `IMultiObjectTracker`,
-    `IIdentityRepository`, `IStateTracker`) to decouple domain logic (`core/`) from infrastructure
-    (`extraction/`, `vision/`, `ui/`).
-
-- [Book - Gang of Four (GoF) Design Patterns]
-  Gamma, E., Helm, R., Johnson, R., & Vlissides, J. (1994).
-  "Design Patterns: Elements of Reusable Object-Oriented Software."
-  Addison-Wesley. ISBN: 978-0-201-63361-0.
-  URL: https://refactoring.guru/design-patterns
-  * Command Pattern: `IFrameCommand`, `ReadRTSPCommand`, `ReadKafkaCommand`, `FrameReaderInvoker`.
-  * Abstract Factory Pattern: `ICommandFactory`, `RTSPCommandFactory`, `KafkaCommandFactory`.
-  * Facade Pattern: `FrameReaderManagement`.
-  * Strategy Pattern: `IMultiObjectTracker` -> `VectorizedDeepSort`.
-  * Proxy Pattern: `IdentityManagerServer` (`multiprocessing.managers.BaseManager`).
-
-- [Book - Domain-Driven Design (Entity & Repository Patterns)]
-  Evans, E. (2003).
-  "Domain-Driven Design: Tackling Complexity in the Heart of Software."
-  Addison-Wesley. ISBN: 978-0-321-12521-7.
-  * Entity: `GlobalIdentity` (`core/GlobalIdentity.py`).
-  * Repository & Domain Service: `GlobalIdentityManager` (`core/GlobalIdentityManager.py`).
-
-- [Official Docs - PyTorch CUDA Graphs, Streams & Pinned Memory]
-  PyTorch CUDA Semantics Documentation.
-  URL: https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs
-  NVIDIA CUDA C++ Programming Guide (CUDA Graphs).
-  URL: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs
-  * Used in `BatchInferenceEngine.py` (`torch.cuda.CUDAGraph`, `torch.cuda.Stream`, `pin_memory=True`)
-    and `FrameReaderManagement._run_batched_pipeline_mode` for double-buffered GPU/CPU overlap.
-
-- [Official Docs - Confluent Kafka Python Client]
-  Confluent Kafka Python Documentation.
-  URL: https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html
-  * Used in `extraction/frameReaderCommand/ReadKafkaCommand.py`.
-
-
-================================================================================
-PART 2: LINE-BY-LINE EXPLANATION OF Config.py
-================================================================================
-File: `Config.py`
-Purpose: Centralized configuration class storing all hyperparameters for hardware execution,
-YOLO detection, DeepSORT tracking, loitering detection, cross-camera Re-ID, UI, and Kafka.
-
-- Lines 1-5: Defines `class Config:` with docstring describing centralized configuration.
-- Line 9 (`USE_GPU = True`): Boolean flag enabling CUDA GPU execution when available (`False` forces CPU).
-- Line 13 (`EXECUTION_MODE = "batched"`): Selects `"batched"` mode (single-process multi-camera GPU batching + double buffering) or `"multiprocess"` mode (legacy 1-OS-process-per-camera with socket IPC).
-- Line 14 (`USE_CUDA_GRAPHS = True`): Enables capturing the entire YOLO + ROI-Align + MobileNetV3 forward pass into a static `torch.cuda.CUDAGraph`.
-- Line 15 (`MAX_CAMERAS_BATCH = 8`): Maximum number of cameras batched together per GPU step.
-- Line 16 (`MAX_DETECTIONS_PER_CAMERA = 28`): Top-K person candidates extracted per camera frame before CPU filtering and NMS (increased from 16 to 28 so crowded frames never drop people).
-- Lines 21-22 (`VIDEO_FILE_REALTIME_PACING = False`, `LOOP_LOCAL_VIDEOS = True`): Controls whether local `.mp4` files run unthrottled or at native FPS, and whether they loop upon reaching EOF.
-- Line 25 (`YOLO_MODEL_PATH = "models/yolo26n.pt"`): Path to the Ultralytics YOLO26n weights file.
-- Line 26 (`YOLO_CONF_HIGH = 0.28`): Primary confidence threshold for Stage A1/B1/A2 association and track initiation.
-- Line 27 (`YOLO_CONF_LOW = 0.18`): Secondary confidence threshold for ByteTrack-style Stage B2 recovery of partially occluded people in crowds.
-- Line 28 (`YOLO_INIT_CONF = 0.30`): Minimum confidence required to create a new tentative track.
-- Line 29 (`YOLO_IOU_THRESHOLD = 0.55`): Crowd-aware Intra-Class NMS IoU threshold so two people standing close together (`IoU <= 0.55`) are not merged into one box.
-- Lines 32-35 (`MIN_BOX_WIDTH = 14`, `MIN_BOX_HEIGHT = 28`, `MIN_ASPECT_RATIO = 0.14`, `MAX_ASPECT_RATIO = 2.85`): Geometric bounding-box bounds rejecting non-human noise slivers or full-frame lens occlusions.
-- Line 38 (`DEEPSORT_MAX_AGE = 90`): Maximum missed frames a local track stays in the local Kalman tracker (~3s at 30 FPS) before relying on Global Re-ID.
-- Line 39 (`DEEPSORT_N_INIT = 2`): Base consecutive hits required to confirm a tentative track (`2` hits if `conf >= 0.42`, `3` hits if `0.30 <= conf < 0.42`).
-- Line 40 (`DEEPSORT_MAX_IOU_DISTANCE = 0.62`): Maximum `1 - IoU` distance allowed in Stage B1 IoU matching (requires `IoU >= 0.38`).
-- Line 41 (`DEEPSORT_MAX_COSINE_DISTANCE = 0.30`): Maximum appearance cosine distance allowed in local DeepSORT Stage A1/A2 matching.
-- Line 42 (`DEEPSORT_NN_BUDGET = 35`): Maximum number of diverse appearance vectors stored per local track.
-- Line 43 (`DEEPSORT_MAX_COAST_FRAMES = 2`): Maximum consecutive missed frames a confirmed interior track continues rendering via damped Kalman velocity.
-- Line 44 (`DEEPSORT_BOX_SMOOTH_ALPHA = 0.65`): Exponential Moving Average (EMA) smoothing factor for bounding-box stabilization.
-- Lines 47-49 (`STOPPED_SECONDS_THRESHOLD = 3`, `STOPPED_PIXEL_THRESHOLD = 15`, `MOVEMENT_BREAKOUT_THRESHOLD = 30`): Time window (3s) and spatial hysteresis radii (15px to enter stopped state, 30px to break out of stopped state).
-- Line 52 (`SIMILARITY_THRESHOLD = 0.32`): Maximum cosine distance for intra-camera Global Re-ID.
-- Line 53 (`INTER_CAMERA_THRESHOLD = 0.36`): Maximum cosine distance for cross-camera Global Re-ID after leaving a previous camera.
-- Line 54 (`SIMULTANEOUS_INTER_CAMERA_THRESHOLD = 0.30`): Stricter cross-camera cosine distance threshold when an identity was seen `< 0.35s` ago in another camera (not near an exit edge).
-- Line 56 (`MAX_SPATIAL_DISTANCE = 160`): Reference spatial radius (in pixels) for same-camera short-term re-identification gating.
-- Line 57 (`MAX_TIME_LOST = 120.0`): Seconds (2 minutes) an unseen identity remains active in `GlobalIdentityManager` before archiving.
-- Line 58 (`CAMERA_SWITCH_COOLDOWN = 0.8`): Cooldown (seconds) preventing rapid camera ping-pong when two cameras overlap.
-- Line 59 (`AUTO_CLUSTER_TIME_THRESHOLD = 15.0`): Maximum transition time (seconds) between two cameras to automatically merge them into the same `Ambiente` cluster via Union-Find.
-- Line 62 (`FEATURE_UPDATE_INTERVAL = 3`): Interval (in frames) at which active local tracks sync their appearance and position to `GlobalIdentityManager`.
-- Lines 65-70 (`DISPLAY_ENABLED`, `DISPLAY_GRID_VIEW`, `DISPLAY_MAX_FPS`, `COLOR_STOPPED`, `COLOR_MOVING`, `FONT_SCALE`): GUI window and annotation styling parameters.
-- Lines 73-77 (`KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `KAFKA_TARGET_CAMERA`, `KAFKA_EXPECTED_CAMERAS`): Apache Kafka consumer settings.
-- Lines 80-81 (`PROCESSING_WIDTH = 640`, `PROCESSING_HEIGHT = 480`): Standard frame resolution (both divisible by 32 for zero-padding YOLO stride alignment).
-
-
-================================================================================
-PART 3: LINE-BY-LINE EXPLANATION OF vision/featureExtractor.py
-================================================================================
-File: `vision/featureExtractor.py`
-Purpose: Computes 576-dimensional L2-normalized multi-stripe appearance embeddings combining
-MobileNetV3-Small deep semantics, mid-level clothing texture, and illumination-invariant
-Gray-World white-balanced color/chromaticity descriptors.
-
-- Lines 8-14: Imports `numpy`, `torch`, `torch.nn.functional as F`, `torchvision.models`, `roi_align`, and `Config`.
-- Lines 16-18: Reads `Config.USE_GPU`, selects `cuda:0` if available (else `cpu`), and sets `_use_fp16 = True` when running on CUDA.
-- Lines 20-26: Loads pretrained `MobileNet_V3_Small_Weights.DEFAULT` convolutional feature extractor, moves it to `_device` in eval mode (and `.half()` on GPU), and splits it into:
-  * `_backbone_mid = _backbone[:9]`: Layers 0..8 producing `(N, 48, 8, 4)` mid-level texture maps from `(N, 3, 128, 64)` crops.
-  * `_backbone_deep = _backbone[9:]`: Layers 9..12 producing `(N, 576, 4, 2)` deep semantic feature maps.
-- Lines 28-30: Allocates ImageNet normalization tensors `_mean = [0.485, 0.456, 0.406]` and `_std = [0.229, 0.224, 0.225]` shaped `(1, 3, 1, 1)`.
-- Lines 32-39: Pre-warms common batch sizes `(1, 4, 8, ..., 128)` on GPU with `_pad_buf` so cuDNN finishes kernel autotuning at startup rather than stalling during live video.
-
-Function: `extract_multistripe_embeddings_from_maps(crops_rgb_01, mid_map, deep_map)` (Lines 42-132)
-- Lines 55-56: Computes global semantic summary `g_avg` (68% spatial mean + 32% spatial max over the `4x2` deep map, shape `(N, 576)`) and 4 horizontal stripes `s4_raw` (68% width mean + 32% width max, shape `(N, 576, 4)`).
-- Lines 58-59: Pads `s4_raw` with replicate mode (`s4_pad`) and blends each horizontal stripe (`65%` self + `17.5%` upper neighbor + `17.5%` lower neighbor). This vertical smoothing makes the embedding invariant to 10-15% vertical bounding-box framing or camera-pitch differences between cameras.
-- Lines 61-66: Compresses the 576 channels per stripe into 144 channels (`s4.view(-1, 4, 144, 4).mean(dim=1)`), flattens the 4 stripes back into `576D` (`deep_stripes`), zero-centers both `deep_stripes` and `g_avg`, and fuses them (`F.normalize(deep_stripes) + 0.55 * F.normalize(g_centered)`) into `deep_part` (`(N, 576)`).
-- Lines 69-74: Extracts the Mid-Level Texture branch (`mid_part`, `(N, 192)`):
-  * Line 69 (`mid_inner`): Weights the inner 2 horizontal columns `[:, :, :, 1:3]` (the person's torso/legs) by `0.82` and the full width by `0.18` so background walls or adjacent people at the box edges are suppressed.
-  * Lines 70-72: Pools `mid_inner` into 4 fine horizontal stripes (`mid_4`) and 2 coarse horizontal stripes (`mid_2`, repeated to match shape), blending `0.70 * mid_4 + 0.30 * mid_2`.
-  * Lines 73-74: Zero-centers and L2-normalizes into `mid_part` (`192D`).
-- Lines 77-120: Extracts the Illumination-Invariant Color & Chromaticity branch (`col_part`, `(N, 192)`):
-  * Line 77 (`body = crops_rgb_01[:, :, 14:114, 16:48].float()`): Crops the inner torso/legs region (vertical rows `14..114` out of `128`, horizontal columns `16..48` out of `64`) to exclude background floor/walls and adjacent people.
-  * Lines 81-84 (Gray-World White-Balance Normalization): Computes per-crop mean per RGB channel `ch_mean` (clamped to `[0.10, 0.92]`) and overall luminance mean `lum_mean`, then scales `wb_body = (body * (lum_mean / ch_mean)).clamp(0.0, 1.0)`. This removes warm/cool lighting tints across different cameras.
-  * Lines 86-88: Computes raw luminance `lum = 0.299*R + 0.587*G + 0.114*B` and contrast-normalizes it (`lum_norm`) using per-crop mean and standard deviation so exposure changes across cameras do not shift brightness features.
-  * Lines 90-102: Computes white-balanced opponent color channels `rg = (rw - gw) * 1.35`, `yb = (0.5*(rw + gw) - bw) * 1.35`, raw chromaticity ratios `(rn, gn, bn)`, white-balanced chromaticity ratios `(rwn, gwn, bwn)`, and HSV-like color saturation `sat = (cmax - cmin) / (cmax + 0.01)`.
-  * Lines 105-107 (`col_stack`): Concatenates all 12 illumination-robust channels along `dim=1`.
-  * Line 109 (`col_core`): Pools horizontally with 75% weight on the innermost 16 pixels (`8:24`) and 25% on the 32-pixel torso width.
-  * Lines 110-117: Computes 8-stripe average pooling (`col_avg_8`, `96D`), 4-stripe coarse pooling interpolated to 8 stripes (`col_coarse_4`, `96D`), and 8-stripe max pooling (`col_max_8`, `96D`), concatenating them into a `192D` multi-scale color vector `col_feat`.
-  * Lines 118-119: Zero-centers and L2-normalizes into `col_part` (`192D`).
-- Lines 122-125: Fuses `deep_part`, `mid_part`, and `col_part` into three 192D blocks (`b1`, `b2`, `0.95 * col_part`) and applies final L2 normalization to return the `(N, 576)` unit embedding tensor.
-
-Functions: `compute_part_based_embeddings`, `extract_features_batch_from_frame`, `extract_deep_reid_feature` (Lines 135-200)
-- Lines 135-157 (`compute_part_based_embeddings`): Standalone wrapper that normalizes `(N, 3, 128, 64)` crops using `_mean`/`_std`, pads to pre-warmed bucket sizes on GPU if `n <= 128`, runs `_backbone_mid` and `_backbone_deep`, and calls `extract_multistripe_embeddings_from_maps`.
-- Lines 160-176 (`extract_features_batch_from_frame`): Extracts `(K, 576)` embeddings for all boxes in a single BGR NumPy frame using `roi_align` + `compute_part_based_embeddings`.
-- Lines 179-198 (`extract_deep_reid_feature`): Extracts a single `(576,)` embedding for one bounding box `[x1, y1, x2, y2]` using `F.interpolate` + `compute_part_based_embeddings`.
-- Lines 201-203: Backward-compatible function aliases (`extract_color_histogram`, etc.).
-
-
-================================================================================
-PART 4: LINE-BY-LINE EXPLANATION OF vision/BatchInferenceEngine.py
-================================================================================
-File: `vision/BatchInferenceEngine.py`
-Purpose: Unified multi-camera GPU/CPU inference engine executing dual-head YOLO26n person
-detection, GPU ROI-Align, MobileNetV3 multi-stripe Re-ID extraction, and crowd-aware NMS.
-
-Class: `_GraphSlot` (Lines 20-64)
-- Lines 20-38: Stores batch dimensions `(batch_size, height, width, max_dets, device, dtype)` and checks whether pinned host memory (`use_pin`) should be enabled.
-- Lines 40-52: Allocates double-buffered (`[slot 0, slot 1]`) page-locked CPU tensors:
-  * `pinned_in`: `(B, H, W, 3)` `uint8` input frames buffer.
-  * `pinned_dets`: `(B, max_dets, 6)` `float32` output detections buffer `[x1, y1, x2, y2, conf, cls]`.
-  * `pinned_feats`: `(B, max_dets, 576)` `float32` output Re-ID embeddings buffer.
-- Lines 54-64: Allocates static GPU tensors `static_bgr` and `batch_idx_static` (the camera batch index column required by `roi_align`) and placeholders for `out_dets`, `out_feats`, and `self.graph` (`torch.cuda.CUDAGraph`).
-
-Class: `BatchInferenceEngine` (Lines 67-436)
-- Lines 73-93 (`__init__`): Reads resolution, `MAX_DETECTIONS_PER_CAMERA` (`28`), `USE_GPU`, `USE_CUDA_GRAPHS`, confidence/IoU thresholds, and geometric limits from `config`; initializes thread lock `_lock` and dedicated CUDA stream `_stream`.
-- Lines 95-127: Loads `YOLO(self.config.YOLO_MODEL_PATH)`. Before calling `yolo.predict(dummy)` (which calls `Detect.fuse()` and sets `head.cv2 = head.cv3 = None`), saves references `cv2_o2m` and `cv3_o2m` to the `one2many` detection head, fuses their internal `Conv+BN` layers, runs warmup `yolo.predict(dummy)`, and re-attaches `head.cv2` and `head.cv3` in FP16/FP32.
-- Lines 129-174 (`_dual_head_person_forward`): Custom forward pass for the YOLO26n `Detect` head:
-  * Lines 133-136: Evaluates both `head.one2one` (`o2o`) and `head.one2many` (`o2m`) heads and decodes anchor boxes and class probabilities into shape `(B, 6300, 84)`.
-  * Lines 141-147: Extracts class-0 (`person`) scores `p_o2o` and `p_o2m`, zeroing out any anchor where a non-person class (`sc[..., 1:].amax`) strongly dominates `person` (`p_o2o < other_o2o * 0.75` or `p_o2m < other_o2m * 0.80`).
-  * Lines 149-160: Applies 3x3 spatial `F.max_pool2d` peak selection across each FPN feature map in `o2m_raw["feats"]` (`60x80`, `30x40`, `15x20`) so only true local spatial peaks per person survive in `p_o2m_peak` (scaled by `0.92`).
-  * Lines 162-171: Selects the stronger candidate between `p_o2o` and `p_o2m_peak` at every anchor, extracts `topk(max_dets, dim=1)`, gathers the corresponding bounding boxes `top_boxes`, and returns `(out, o2o_raw)` with static shape `(B, max_dets, 6)`.
-- Lines 175-188: Fallback `_person_only_postprocess` for single-head YOLO models.
-- Lines 190-208: Initializes `MobileNetV3-Small` split into `backbone_mid` (`[:9]`) and `backbone_deep` (`[9:]`), ImageNet `_mean`/`_std`, and `_slots` dictionary.
-- Lines 210-250 (`_build_slot`):
-  * Lines 214-230 (`_forward_pass`): Converts `slot.static_bgr` from BGR `uint8` to normalized RGB `[0, 1]`, runs `self.net(t_rgb)[0]`, clamps box coordinates `[b_x1, b_y1, b_x2, b_y2]` to image bounds, extracts `(B * max_dets, 3, 128, 64)` crops via `roi_align`, runs `backbone_mid` and `backbone_deep`, and calls `extract_multistripe_embeddings_from_maps` to produce `(B, max_dets, 576)` embeddings.
-  * Lines 232-244: When `use_cuda_graphs=True`, runs 4 warmup iterations on `self._stream` and captures `_forward_pass()` into `slot.graph = torch.cuda.CUDAGraph()`.
-- Lines 258-287 (`launch_async`): Copies input frames into `slot.pinned_in[buf_idx]`, asynchronously transfers them to `slot.static_bgr`, replays `slot.graph.replay()` (or `_eager_fn()`), and queues asynchronous device-to-host copies into `pinned_dets[buf_idx]` and `pinned_feats[buf_idx]`.
-- Lines 289-363 (`synchronize_and_filter`):
-  * Synchronizes `self._stream`, reads NumPy views of `pinned_dets` and `pinned_feats`, clips coordinates to `[0, width]` and `[0, height]`, and computes width `w`, height `h`, aspect ratio `ar`, and area.
-  * Lines 320-335: Filters out boxes below `conf_low`, smaller than `min_w`/`min_h`, outside `[min_ar, max_ar]`, full-screen lens occlusions, and narrow border slivers (`w < 20` at image edge with `conf < 0.55`).
-  * Lines 349-354: Applies `self._nms_cpu(v_boxes, v_confs, self.iou_thresh)` to remaining valid detections.
-- Lines 365-420 (`_nms_cpu`): Crowd-aware greedy NMS:
-  * Sorts detections by confidence descending (`order`).
-  * Computes pairwise `iou`, containment `io_min = inter / min(area_i, area_rest)`, normalized center distances `dx_norm`, `dy_norm`, height ratio `scale_ratio`, and head alignment `top_aligned`.
-  * Suppresses a lower-scoring box ONLY if:
-    1) `iou > iou_threshold` (`0.55`), OR
-    2) `same_center_dup`: `(iou > 0.44) & (dx_norm < 0.15) & (dy_norm < 0.15) & (scale_ratio > 0.78)` (duplicate anchor pair on the exact same person center), OR
-    3) `is_subpart`: `(scale_ratio < 0.72) & (io_min > 0.84) & (dx_norm < 0.20) & ((scores[rest] < 0.52) | top_aligned)` (shorter torso/head box inside a full-body box on the same vertical axis).
-  * Preserves nearby or partially occluded people standing beside or behind another person.
-- Lines 422-436 (`infer_batch` & `cleanup`): Synchronous convenience wrapper and CUDA stream/graph cleanup on shutdown.
-
-
-================================================================================
-PART 5: LINE-BY-LINE EXPLANATION OF vision/VectorizedDeepSort.py
-================================================================================
-File: `vision/VectorizedDeepSort.py`
-Purpose: Vectorized Multi-Object Tracker replacing `deep-sort-realtime`. Implements an 8D
-velocity-clamped Kalman filter, 4-stage priority association cascade (DeepSORT + ByteTrack),
-adaptive EMA box stabilization, and crowd-safe duplicate track suppression.
-
-Class: `VectorizedTrack` (Lines 23-164)
-- Lines 26-43: Declares `__slots__` for memory efficiency and defines track lifecycle states:
-  `TENTATIVE = 1` (newly created, awaiting confirmation), `CONFIRMED = 2` (active verified track),
-  and `DELETED = 3` (expired or merged track).
-- Lines 45-68 (`__init__`): Initializes `track_id`, 8D state `mean = [cx, cy, a, h, vx, vy, va, vh]`,
-  `8x8` `covariance`, `hits = 1`, `age = 1`, `time_since_update = 0`, L2-normalized `ema_feat`,
-  `gallery` matrix `(1, 576)`, `det_conf`, `nn_budget`, and initial smoothed box `smooth_ltrb`.
-- Lines 70-77 (`is_tentative`, `is_confirmed`, `is_deleted`): Boolean state helpers.
-- Lines 79-93 (`raw_kalman_ltrb`, `to_ltrb`, `to_ltwh`): Converts Kalman state `(cx, cy, a, h)` into
-  `[x1, y1, x2, y2]` (`ltrb`) or `[x, y, w, h]` (`ltwh`), clamping height `h >= 16.0` and aspect ratio `a in [0.12, 3.0]`.
-- Lines 95-127 (`sync_smooth_box`):
-  * Lines 105-116 (Matched frame `det_ltrb is not None`): Blends `0.72 * detector_box + 0.28 * kalman_box`
-    and applies motion-adaptive EMA smoothing (`eff_alpha` increases up to `0.92` when `center_shift` is
-    large so fast-walking people never lag behind their bounding box, while stationary people get jitter-free boxes).
-  * Lines 117-127 (Coasting frames `time_since_update in (1, 2)`): Shifts `smooth_ltrb` by damped linear
-    velocity (`0.30 * vx, 0.30 * vy` on frame 1; `0.15 * vx, 0.15 * vy` on frame 2).
-- Lines 129-130 (`get_feature`): Returns the track's current normalized `ema_feat`.
-- Lines 132-164 (`update_appearance`):
-  * Lines 133-142: Normalizes `feat` to unit length `unit_feat`. On mature tracks (`hits > 4`), rejects
-    sudden appearance outliers (`sim_to_ema < 0.52`) caused by partial occlusion.
-  * Lines 144-149: Updates `self.ema_feat` using fast adaptation during the first 4 hits (`ema_weight = 0.55`)
-    so noisy doorway/border entry features are quickly replaced by full-body interior features, and stable
-    adaptation (`ema_weight = 0.84`) thereafter.
-  * Lines 151-164: Diversity-preserving gallery update: if the new vector is nearly identical (`dot > 0.93`)
-    to an existing gallery entry, blends it in-place (`0.70 * old + 0.30 * new`) so standing still never
-    overwrites distinct poses; otherwise appends or rolls the gallery up to `nn_budget`.
-
-Class: `VectorizedDeepSort` (Lines 167-695)
-- Lines 172-173 (`CHI2_INV_95_4D = 9.4877`, `INFTY_COST = 1e5`): 95th percentile of the 4-DOF Chi-Square
-  distribution for Mahalanobis gating and infinity cost sentinel for Hungarian assignment.
-- Lines 175-201 (`__init__`): Stores tracker thresholds (`max_age`, `n_init`, `max_iou_distance`,
-  `max_cosine_distance`, `nn_budget`, `conf_high`, `conf_low`, `init_conf`, `box_smooth_alpha`),
-  track list `self.tracks`, `_next_id = 1`, and Kalman noise factors `_std_pos = 1/20`, `_std_vel = 1/160`.
-- Lines 203-211 (`_boxes_to_xyah`): Vectorized conversion of `(N, 4)` `[x1, y1, x2, y2]` boxes into
-  Kalman measurement space `[cx, cy, a, h]` where `a = w / h`.
-- Lines 213-235 (`_compute_iou_and_containment` & `_compute_iou_matrix`): Vectorized `(K, M)` pairwise
-  Intersection-over-Union (`iou`) and Intersection-over-Minimum-Area (`io_min`) matrices using NumPy broadcasting.
-- Lines 237-287 (`_predict_all`): Vectorized Kalman prediction across all alive tracks:
-  * Line 243 (`means[:, 6] = 0.0`): Forces aspect-ratio velocity `va = 0` so boxes never stretch horizontally.
-  * Lines 245-254: Gradually damps velocity (`means[i, 4:6] *= 0.65`) during brief occlusions (`1 <= tsu <= 6`)
-    so a person walking behind another person continues along their walking path, and zeroes velocity after
-    6 missed frames (`tsu > 6`) so lost boxes never drift off-screen.
-  * Lines 256-259: Advances positions `means[:, :4] += means[:, 4:]` and clamps aspect ratio and height.
-  * Lines 261-280: Vectorized covariance propagation $P' = F P F^T + Q$ applied to active/recently-seen
-    tracks (`time_since_update <= 4`), preventing covariance explosion during long occlusions.
-- Lines 289-352 (`_kalman_update_batch`): Vectorized Kalman measurement update for all matched `(track, det)` pairs:
-  * Lines 303-315: Computes innovation covariance $S = H P H^T + R$, solves for Kalman gain $K = P H^T S^{-1}$
-    via `np.linalg.solve`, and updates `new_means` and `new_covs` via `np.einsum`.
-  * Lines 317-340: Clamps updated aspect ratio, height, and velocity to realistic human walking speeds.
-  * Lines 341-352: Resets `time_since_update = 0`, increments `hits`, updates `smooth_ltrb`, confirms
-    `TENTATIVE` tracks (`req_hits = n_init` if `conf >= 0.42`, else `n_init + 1`), and updates appearance
-    only when `is_clean` is `True` (not overlapping another detection).
-- Lines 354-430 (`_match_stage_a_subset`): Appearance + motion Hungarian matching helper used by Stage A1 and Stage A2:
-  * Lines 372-386: Computes vectorized Mahalanobis distance `maha`, pairwise `iou_mat`, center distance
-    `center_dist`, and height ratio `scale_ratio`.
-  * Lines 391-400: Computes hybrid appearance distance `0.65 * min_gallery_dist + 0.35 * ema_dist`,
-    subtracts a small spatial overlap bonus `0.05 * iou_mat`, and adds a small age penalty.
-  * Lines 402-411: Applies spatial/scale gating: for active tracks (`strict_occlusion=False`), gates by
-    Mahalanobis/IoU, `scale_ratio >= 0.50`, and `max_radius`; for occluded tracks (`strict_occlusion=True`),
-    uses an expanding physical radius `max(160.0, t_h * (0.95 + 0.18 * min(tsu, 15)))` and `scale_ratio >= 0.48`
-    so people emerging on the far side of an occluding person are recovered smoothly.
-  * Lines 414-430: Solves optimal 1-to-1 assignment via `scipy.optimize.linear_sum_assignment`.
-- Lines 432-486 (`_suppress_duplicate_tracks`): Crowd-safe track-level NMS:
-  * Sorts alive tracks by confirmation status, recency (`time_since_update`), `hits`, and `track_id`.
-  * When two tracks both matched distinct detections in the current frame (`ta.time_since_update == 0` and
-    `tb.time_since_update == 0`), only marks `tb` as `DELETED` if both their boxes (`iou > 0.72`) and
-    appearances (`app_sim > 0.78`) are duplicates of the same person.
-  * When one track is coasting (`time_since_update > 0`), only suppresses it if it has high appearance
-    similarity (`app_sim > 0.74`) with the overlapping track, preserving occluded tracks of different people.
-- Lines 488-695 (`update`): Main per-frame tracking step:
-  * Lines 503-524: Splits detections into `high` (`>= conf_high`) and `low` (`conf_low <= conf < conf_high`),
-    and computes `high_clean` (`det_iou < 0.18` and `det_iomin < 0.35`) to identify isolated detections.
-  * Lines 539-551 (Stage A1): Priority appearance+motion matching for active confirmed tracks (`tsu <= 2`).
-  * Lines 553-588 (Stage B1): IoU + appearance-vetoed matching for remaining recently seen confirmed and
-    tentative tracks (`tsu <= 2`).
-  * Lines 590-602 (Stage A2): Occlusion recovery for confirmed tracks with `tsu > 2`.
-  * Lines 609-642 (Stage B2): ByteTrack low-confidence IoU + appearance recovery (`low_boxes`) for tracks
-    partially occluded in crowds (`tsu <= 2`).
-  * Lines 653-695: Initiates new tracks from remaining unmatched high-confidence detections (`>= init_conf`),
-    checking overlap only against currently visible (`time_since_update == 0`) tracks so nearby people can
-    always start tracks.
-
-
-================================================================================
-PART 6: LINE-BY-LINE EXPLANATION OF vision/cameraWorker.py & vision/cameraWorker2.py
-================================================================================
-File: `vision/cameraWorker.py`
-Purpose: Per-camera tracking worker that bridges local `VectorizedDeepSort` tracks with
-cross-camera `GlobalIdentityManager`, evaluates stopped/loitering state, and draws annotations.
-
-- Lines 26-61 (`__init__`): Stores `cam_id`, `config`, `global_manager`, and `_inference_engine`;
-  initializes `local_to_global_map` (`{local_track_id: global_id}`), `_prev_stopped_map`,
-  `_last_annotations`, `StoppedStateTracker`, and `VectorizedDeepSort`.
-- Lines 63-67 (`_get_or_init_engine`): Lazily initializes `BatchInferenceEngine` for standalone callers.
-- Lines 69-78 (`_is_exiting_border`): Checks if a bounding box touches the 6-pixel image border so
-  exiting tracks stop immediately instead of coasting off-screen.
-- Lines 80-280 (`process_detections`):
-  * Lines 93-97: If `is_new_frame=False` (cached frame from an asynchronous camera stream), redraws
-    `self._last_annotations` and `draw_camera_hud` and returns immediately without mutating tracker
-    state, stopped state, or `GlobalIdentityManager` timestamps.
-  * Lines 99-113: Computes exponentially smoothed camera FPS (`self.fps`), increments `frame_counter`,
-    and runs `tracks = self.tracker.update(boxes_xyxy, confs, feats)`.
-  * Lines 115-128: Queries `global_manager.get_identity_current_camera(gid)` for unmatched local tracks
-    (`time_since_update > 0`); if the identity has already transitioned to another camera, unmaps and
-    deletes the stale local track immediately.
-  * Lines 130-145: Cleans dead local IDs from `local_to_global_map` and builds `active_global_ids` from
-    tracks matched in the current frame (`time_since_update == 0`).
-  * Lines 147-172: Sorts confirmed tracks (`time_since_update == 0` first) and computes `isolated_mask`
-    (`t_iou < 0.16` and `t_iomin < 0.32`) so appearance updates to `GlobalIdentityManager` only occur
-    when a person is not overlapping another person.
-  * Lines 178-259: Iterates through confirmed tracks:
-    - If `local_id not in self.local_to_global_map`: calls `global_manager.get_or_create_global_id(...)`
-      and retires any older unmatched local track in the same camera that previously held that `global_id`.
-    - If `local_id in self.local_to_global_map`: calls `global_manager.update_existing_identity(...)`
-      every `feature_update_interval` frames (and during the first 12 hits for rapid provisional ID
-      consolidation). Handles both provisional ID merges (`resolved_id != global_id`) and cross-camera
-      hijack rejection (`resolved_id is None`).
-  * Lines 261-278: Evaluates `state_tracker.update_and_evaluate(global_id, box, current_time)`, records
-    stopped episodes via `global_manager.record_stopped_state(...)`, and renders person boxes and HUD.
-- Lines 282-300 (`process_frame`, `normalize_feature`, `cleanup`): Single-camera convenience entrypoint,
-  L2 vector normalization helper, and resource cleanup logger.
-
-File: `vision/cameraWorker2.py`
-- Lines 1-7: Backward-compatible alias module re-exporting `CameraWorker` from `vision.cameraWorker`.
-
-
-================================================================================
-PART 7: LINE-BY-LINE EXPLANATION OF core/GlobalIdentity.py
-================================================================================
-File: `core/GlobalIdentity.py`
-Purpose: Domain Entity representing a unique person across cameras, maintaining global and
-per-camera EMA appearance vectors, a diverse multi-pose gallery, and chronological camera passages.
-
-- Lines 15-56 (`__init__`): Initializes `global_id`, L2-normalized `ema_feature`, per-camera appearance
-  dictionary `camera_ema_features = {initial_cam_id: unit_feat}`, diversity gallery `_gallery_matrix`,
-  `max_gallery_size = 32`, `update_count = 1`, `last_bbox`, `last_bbox_per_camera`, `first_seen`,
-  `last_seen`, `current_camera`, `last_seen_per_camera`, and initial `passage_records` entry.
-- Lines 58-80 (`_normalize`, `camera_history`, `feature_gallery`, `feature_vector`): L2 normalization
-  helper and backward-compatible properties.
-- Lines 82-110 (`match_score`):
-  * Computes cosine similarities `dots = self._gallery_matrix @ candidate_norm`, `best_gal_sim`, and `ema_sim`.
-  * Checks `self.camera_ema_features` (using `cam_id`'s specific EMA if available, or the best per-camera
-    EMA across visited cameras) so returning to a previously visited camera matches against that camera's
-    lighting and angle.
-  * Combines `0.70 * best_gal_sim + 0.30 * top3_gal_sim` (`gal_sim`) with `ema_sim` (`0.72 * gal_sim + 0.28 * ema_sim`)
-    and converts similarity into cosine distance `1.0 - combined_sim` in `[0.0, 1.0]`.
-- Lines 112-140 (`_integrate_feature`):
-  * Updates `ema_feature` and `camera_ema_features[cam_id]` when the candidate vector is consistent with
-    the identity (`sim_to_ema >= 0.54` or `max_gal_sim >= 0.58` or `force_accept`).
-  * Uses diversity-preserving gallery management: if `max_gal_sim > 0.92`, blends into the closest
-    existing gallery slot (`0.72 * old + 0.28 * new`) instead of rolling out older camera views; otherwise
-    appends or rolls `_gallery_matrix`.
-- Lines 142-222 (`update`):
-  * Integrates new appearance features, updates `last_bbox`, `last_seen`, and `last_seen_per_camera[cam_id]`.
-  * If `self.current_camera != cam_id` and transition conditions hold (`force_transition`, `time_since_primary >= 0.25`,
-    or `time_since_last_switch >= switch_cooldown`), closes the previous passage record, updates
-    `self.current_camera = cam_id`, and appends a new passage record with `origin_camera = old_cam`.
-  * If `self.current_camera == cam_id`, extends `timestamp_out` and `exit_bbox` (or starts a new passage
-    if the person re-entered the same camera after `> 4.0s`).
-- Lines 224-258 (`update_stopped_duration` & `get_raw_history`): Updates maximum stopped seconds for the
-  active camera passage and formats passage history with `next_camera` (`"Saida"` for the final record)
-  and `duration_seconds` for CSV export.
-
-
-================================================================================
-PART 8: LINE-BY-LINE EXPLANATION OF core/GlobalIdentityManager.py
-================================================================================
-File: `core/GlobalIdentityManager.py`
-Purpose: Thread-safe Repository and Domain Service managing cross-camera Re-ID matching,
-provisional identity consolidation, Union-Find spatial camera clustering, and CSV event export.
-
-- Lines 21-70 (`CSV_FIELDS` & `__init__`): Defines the 17 CSV columns, loads intra/inter-camera thresholds
-  (`0.32`, `0.36`, `0.30`), `max_time_lost` (`120.0s`), `max_spatial_distance` (`160px`), `switch_cooldown` (`0.8s`),
-  `CameraClusterManager`, active `identities` dict, `archived_identities` dict, `event_log`, and `threading.RLock()`.
-- Lines 72-85 (`_get_center` & `_is_near_edge`): Computes box center `(cx, cy)` and checks whether a box is
-  clipped by the 3% frame border (used to avoid polluting galleries with half-visible border crops and to
-  detect when a person is exiting a camera).
-- Lines 87-98 (`_cleanup_old_identities`): Archives identities unseen for `> max_time_lost * 3.0` into
-  `archived_identities` so active matching stays fast while preserving full history for CSV export.
-- Lines 100-137 (`_check_and_update_clusters`): When a person transitions from `old_cam` to `cam_id` within
-  `auto_cluster_threshold` (`15.0s`), calls `self.cluster_manager.union(cam_id, old_cam)` to merge both
-  cameras into the same `Ambiente` and appends a `CAMERA_MERGE` event to `self.event_log`.
-- Lines 139-216 (`_find_best_matching_identity`):
-  * Evaluates all candidate identities not in `active_global_ids` (and `< max_candidate_id` when consolidating).
-  * For same-camera candidates (`is_same_camera`): applies physical speed/distance and scale-ratio gates
-    for recently lost tracks (`time_lost < 3.0s`), gives a `-0.035` spatial continuity bonus when very close,
-    and checks `effective_dist < self.intra_camera_threshold`.
-  * For cross-camera candidates: selects `simultaneous_inter_camera_threshold` (`0.30`) if seen `< 0.35s` ago
-    in another camera (and not exiting its border), else `inter_camera_threshold` (`0.36`); applies a `-0.030`
-    temporal handoff bonus when transitioning within `auto_cluster_threshold` or within the same `Ambiente` cluster.
-- Lines 218-283 (`_merge_provisional_into_existing`): Merges a newly created provisional identity `prov_id`
-  into an older matching identity `target_id`, preserving the entry timestamp/bbox, removing the provisional
-  `PERSON_DETECTED` log entry, logging the `CAMERA_TRANSITION`, and reclaiming `next_global_id`.
-- Lines 285-355 (`update_existing_identity`):
-  * Step 1 (Online Provisional Identity Consolidation): If `global_id` was created `<= 10.0s` ago on its
-    first `"Entrada"` passage and now has a clean non-edge feature, checks `_find_best_matching_identity`
-    against older identities (`< global_id`) and merges if matched.
-  * Step 2 (Cross-Camera Hijack Protection): If `identity.current_camera != cam_id`, verifies that the
-    feature still matches `identity` (`verify_dist <= inter_camera_threshold * 1.08`), returning `None` if
-    the old camera's track drifted onto another person.
-  * Step 3: Updates `identity` and logs `CAMERA_TRANSITION` if the primary camera switched.
-- Lines 357-409 (`get_identity_current_camera` & `record_stopped_state`): Returns current owner camera of
-  `global_id` and records `PERSON_STOPPED` episodes when `identity.current_camera == cam_id`.
-- Lines 411-496 (`get_or_create_global_id`): Finds the best match via `_find_best_matching_identity`; if
-  found, updates the identity and logs `CAMERA_TRANSITION`; otherwise creates a new `GlobalIdentity` and
-  logs `PERSON_DETECTED`.
-- Lines 498-760 (`_aggregate_history_by_clusters`, `get_identity_history`, `export_data_to_csv`):
-  Aggregates per-camera passages into `AMBIENTE_SUMMARY` stays by Union-Find cluster root and writes the
-  chronological `tracking_data_final.csv` report.
-
-
-================================================================================
-PART 9: LINE-BY-LINE EXPLANATION OF OTHER core/ MODULES
-================================================================================
-
-1. `core/CameraClusterManager.py` (Lines 1-67)
+1. ARCHITECTURAL RULES & S.O.L.I.D. COMPLIANCE
 ----------------------------------------------
-- Lines 12-15 (`__init__`): Initializes disjoint-set `parent` dictionary and `threading.RLock()`.
-- Lines 17-33 (`find`): Iterative Union-Find root lookup with two-pass **path compression** ($O(\alpha(N))$ amortized time).
-- Lines 35-45 (`union`): Merges two camera clusters deterministically using lexicographical root order (`root1 < root2`).
-- Lines 47-67 (`get_cluster_members`, `get_cluster_label`, `get_all_clusters`): Returns sorted member camera lists and `'+'`-joined cluster labels (e.g., `"cam1+cam2"`).
+Every Python module in the project enforces two strict structural rules:
+- Rule 1: At most 1 class per file (`.py`).
+- Rule 2: At most 20 lines per function or method.
 
-2. `core/StoppedStateTracker.py` (Lines 1-73)
----------------------------------------------
-- Lines 12-23 (`__init__`): Initializes per-person sliding position history (`deque(maxlen=120)`), `stopped_state`, `stopped_since`, and squared pixel thresholds (`_stopped_px_sq = 15^2`, `_breakout_px_sq = 30^2`).
-- Lines 24-34 (`_cleanup_stale`): Purges state for identities unseen for `> 60s`.
-- Lines 35-73 (`update_and_evaluate`): Appends `(current_time, center)` to the sliding window, trims samples older than `STOPPED_SECONDS_THRESHOLD` (`3s`), computes squared displacement over the window, and applies spatial hysteresis (`< 15px` for `>= 3s` enters stopped state; `> 30px` exits stopped state).
+How the S.O.L.I.D. Principles are implemented across the folders:
+- [S] Single Responsibility Principle (SRP):
+  Every package and class has a single well-defined responsibility:
+  * `domain/` holds pure data structures and the `GlobalIdentity` entity.
+  * `interfaces/` holds pure abstract contracts (`ABC`), one per file.
+  * `behaviors/` holds self-contained behavioral plugins (`StoppedStateTracker`, `RestrictedZoneAnalyzer`).
+  * `exporters/` holds self-contained data sinks (`CsvTrajectoryExporter`, `KafkaEventExporter`).
+  * `identity/` holds cross-camera identity resolution (`GlobalIdentityManager`) and topology (`CameraClusterManager`).
+  * `extraction/` holds asynchronous video stream capture (`RTSP`, `MP4`, `Kafka`).
+  * `vision/` holds GPU detection (`BatchInferenceEngine`), feature extraction (`featureExtractor`), and per-camera tracking (`CameraWorker`, `StabilizedTrack`).
+  * `ui/` holds OpenCV rendering (`MultiCameraDisplay`).
 
-3. `core/ports.py` (Lines 1-100)
---------------------------------
-- Defines the Clean Architecture Abstract Base Classes (`ABC`):
-  * `IFrameCommand` (`execute`, `cleanup`)
-  * `ICommandFactory` (`__call__`)
-  * `IMultiObjectTracker` (`update`)
-  * `IIdentityRepository` (`get_or_create_global_id`, `update_existing_identity`, `export_data_to_csv`, `record_stopped_state`)
-  * `IStateTracker` (`update_and_evaluate`)
+- [O] Open/Closed Principle (OCP) & Elimination of `if/else` Chains:
+  * `exporters/ExporterRegistry.py` and `behaviors/BehaviorRegistry.py` implement the Self-Registering Plugin Registry Pattern with `pkgutil.iter_modules` automatic module discovery.
+  * Adding 100 new export sinks or 100 new behavior rules requires ZERO `if/else` statements and ZERO edits to existing code: simply drop a new single-class file into `exporters/` or `behaviors/` decorated with `@ExporterRegistry.register("name")` or `@BehaviorRegistry.register("name")`, and list its name in `Config.ACTIVE_EXPORTERS` or `Config.ACTIVE_BEHAVIORS`.
 
-4. `core/IdentityManagerServer.py` (Lines 1-34) & `core/runtime_setup.py`
--------------------------------------------------------------------------
-- `IdentityManagerServer`: Subclasses `multiprocessing.managers.BaseManager` and registers `GlobalIdentityManager` so legacy multiprocess workers can share a single serialized identity repository over socket IPC.
-- `runtime_setup.py`: Caps OpenMP/MKL/OpenCV/PyTorch CPU thread pools per process to avoid CPU thread oversubscription across camera readers.
+- [L] Liskov Substitution Principle (LSP):
+  * `ReadRTSPCommand` and `ReadKafkaCommand` are interchangeable implementations of `IFrameCommand`.
+  * `CsvTrajectoryExporter` and `KafkaEventExporter` are interchangeable implementations of `IDataExporter`.
+  * `StoppedStateTracker` and `RestrictedZoneAnalyzer` are interchangeable implementations of `IBehaviorAnalyzer`.
+  * `StabilizedTrack` is a behavioral subtype of `deep_sort_realtime.deep_sort.track.Track`.
+
+- [I] Interface Segregation Principle (ISP):
+  * Interfaces are split into small, focused contracts in `interfaces/`:
+    `IFrameCommand.py`, `ICommandFactory.py`, `IBehaviorAnalyzer.py`, `IDataExporter.py`, `IIdentityRepository.py`, and `IStateTracker.py`.
+
+- [D] Dependency Inversion Principle (DIP):
+  * High-level modules (`CameraWorker`, `GlobalIdentityManager`, `BehaviorPipeline`, `ExportPipeline`, `FrameReaderInvoker`) depend on the abstract interfaces in `interfaces/`.
 
 
-================================================================================
-PART 10: LINE-BY-LINE EXPLANATION OF extraction/, ui/display.py, MarkovChain.py & main.py
-================================================================================
+2. FOLDER-BY-FOLDER & FILE-BY-FILE EXPLANATION
+----------------------------------------------
 
-1. `extraction/FrameReaderManagement.py` (Lines 1-269)
-------------------------------------------------------
-- Lines 35-76 (`__init__` & `_camera_factories`): Configures active camera sources (`KafkaCommandFactory`, `RTSPCommandFactory`).
-- Lines 77-85 (`run`): Dispatches to `_run_batched_pipeline_mode()` (`EXECUTION_MODE = "batched"`) or `_run_multiprocess_mode()`.
-- Lines 89-187 (`_run_batched_pipeline_mode`):
-  * Initializes shared `GlobalIdentityManager`, `BatchInferenceEngine`, `MultiCameraDisplay`, and background `FrameReaderInvoker` threads.
-  * Runs the **Double-Buffered Software Pipeline**:
-    1) `engine.launch_async(frames_list, buf_idx)` launches GPU inference for Batch $t$,
-    2) `_process_and_render(prev_batch_state)` runs CPU tracking (`CameraWorker.process_detections`) and GUI rendering for Batch $t-1$ concurrently while the GPU is busy,
-    3) `engine.synchronize_and_filter(curr_slot, curr_buf)` collects filtered Batch $t$ results for the next step.
-  * Exports `tracking_data_final.csv` cleanly in the `finally` block on shutdown.
+A. ROOT CONFIGURATION & ENTRYPOINT
+----------------------------------
+- `main.py`:
+  Configures logging, applies native thread and CUDA/TF32 limits (`identity.runtime_setup.apply`), instantiates `Config` and `FrameReaderManagement`, and starts the system with `multiprocessing` spawn mode.
+- `Config.py`:
+  Centralizes all system parameters:
+  * Hardware & execution: `USE_GPU`, `EXECUTION_MODE` (`"batched"` or `"multiprocess"`), `USE_CUDA_GRAPHS`, `MAX_DETECTIONS_PER_CAMERA = 18`.
+  * YOLO26n detection & chair/furniture filtering: `YOLO_CONF_THRESHOLD = 0.40`, `YOLO_INIT_CONF = 0.48`, `MIN_ASPECT_RATIO = 0.18`, `MAX_ASPECT_RATIO = 0.95`.
+  * `deep-sort-realtime` parameters: `DEEPSORT_MAX_AGE = 90`, `DEEPSORT_N_INIT = 2`, `DEEPSORT_MAX_COSINE_DISTANCE = 0.40`, `DEEPSORT_MAX_IOU_DISTANCE = 0.72`.
+  * Active Behavior Plugins tuple: `ACTIVE_BEHAVIORS = ("stopped",)`.
+  * Active Data Exporters tuple: `ACTIVE_EXPORTERS = ("csv",)` (add `"kafka"` to stream events to Kafka).
 
-2. `extraction/frameReaderCommand/` (`FrameReaderInvoker.py`, `ReadKafkaCommand.py`, `ReadRTSPCommand.py`, `CommandFactories.py`)
----------------------------------------------------------------------------------------------------------------------------------
-- `FrameReaderInvoker.py` (Lines 10-95): Dedicated daemon thread continuously polling `command.execute_batch()` or `command.execute()` and storing the latest frame per camera key in `_latest_frames` and `_cached_frames` so capture I/O never blocks GPU inference.
-- `ReadKafkaCommand.py` (Lines 14-185): Assigns topic partitions directly near the high-watermark offset (`high - 32`), drains queued Kafka messages in batches, retains only the newest JPEG payload per camera key (`latest_bytes_by_cam`), and decodes/resizes frames via `cv2.imdecode`.
-- `ReadRTSPCommand.py`: Reads RTSP streams or local `.mp4` video files via `cv2.VideoCapture`, supporting optional native-FPS pacing and automatic video looping.
+B. `domain/` — DOMAIN ENTITIES & VALUE OBJECTS
+----------------------------------------------
+- `domain/BoundingBox.py`: Dataclass encapsulating `[x1, y1, x2, y2]` and geometric properties (`width`, `height`, `area`, `aspect_ratio`, `center`).
+- `domain/FramePacket.py`: Dataclass encapsulating `(cam_id, frame, timestamp, seq_id)`.
+- `domain/TrackContext.py`: Dataclass passed to every `IBehaviorAnalyzer` on each frame (`global_id`, `local_id`, `cam_id`, `bbox`, `current_time`, `confidence`).
+- `domain/BehaviorResult.py`: Dataclass returned by `IBehaviorAnalyzer.analyze(...)` specifying `name`, `is_active`, `label_suffix`, `color_override`, `event_type`, `duration_seconds`, and `details`.
+- `domain/AnnotationSpec.py`: Dataclass holding the resolved HUD `bbox`, `global_id`, `label`, and `color`.
+- `domain/GlobalIdentity.py`: Domain entity for a unique person across cameras. Uses `scipy.spatial.distance.cdist` for hybrid cosine matching across a multi-pose gallery, per-camera EMA memory, and global EMA centroid, with outlier rejection and diversity-preserving updates.
 
-3. `ui/display.py` (Lines 1-174)
---------------------------------
-- Lines 12-40 (`draw_person_annotation`): Draws the person bounding box (green when moving, red when stopped) and the `ID:<global_id>` (+ `PARADO <elapsed>s`) text badge.
-- Lines 42-69 (`draw_camera_hud`): Draws the top-left overlay with smoothed FPS, active person count, and camera name.
-- Lines 71-174 (`MultiCameraDisplay`): Renders either individual per-camera OpenCV windows or a tiled multi-camera dashboard grid (`_build_grid`), throttled to `DISPLAY_MAX_FPS` (`60 Hz`).
+C. `interfaces/` — APPLICATION PORTS (ABCs)
+-------------------------------------------
+- `interfaces/IFrameCommand.py`: `execute()` and `cleanup()` contract for video stream readers.
+- `interfaces/ICommandFactory.py`: `__call__()` contract for serializable command factories.
+- `interfaces/IBehaviorAnalyzer.py`: `from_config(config)` and `analyze(context)` contract for behavior plugins.
+- `interfaces/IDataExporter.py`: `from_config(config)`, `on_event(event)`, `export(records)`, and `cleanup()` contract for data exporters.
+- `interfaces/IIdentityRepository.py`: Contract for `GlobalIdentityManager`.
+- `interfaces/IStateTracker.py`: Contract for `update_and_evaluate(global_id, box, current_time)`.
 
-4. `MarkovChain.py` & `main.py`
--------------------------------
-- `MarkovChain.py`: Reads `tracking_data_final.csv`, extracts chronological room/camera transitions, builds the Absorbing Markov Chain transition matrix $P$ (`matriz_probabilidades.csv`), computes the fundamental matrix $N = (I - Q)^{-1}$ for expected visit counts and stay durations, and generates the visual analytics dashboard (`dashboard_previsao.png`).
-- `main.py` (Lines 1-35): Sets `mp.set_start_method("spawn", force=True)` for CUDA multiprocessing safety, configures logging, applies `runtime_setup`, and launches `FrameReaderManagement(Config()).run()`.
-================================================================================
+D. `behaviors/` — PLUG-AND-PLAY BEHAVIORAL ANALYTICS (ZERO `if/else`)
+---------------------------------------------------------------------
+- `behaviors/BehaviorRegistry.py`:
+  Implements `@BehaviorRegistry.register("name")` and `discover_plugins()` via `pkgutil.iter_modules`. Instantiates all plugins listed in `Config.ACTIVE_BEHAVIORS` via dictionary lookup without `if/else`.
+- `behaviors/BehaviorPipeline.py`:
+  Composite runner that evaluates all active `IBehaviorAnalyzer` plugins on each person's `TrackContext`, builds the HUD `AnnotationSpec`, and forwards active events to `GlobalIdentityManager.record_behavior_event`.
+- `behaviors/StoppedStateTracker.py`:
+  Registered as `@BehaviorRegistry.register("stopped")`. Uses a sliding time deque and spatial hysteresis (`STOPPED_PIXEL_THRESHOLD`, `MOVEMENT_BREAKOUT_THRESHOLD`) to detect stationary/loitering people.
+- `behaviors/RestrictedZoneAnalyzer.py`:
+  Registered as `@BehaviorRegistry.register("restricted_zone")`. Alerts whenever a person enters a normalized bounding region.
+
+E. `exporters/` — PLUG-AND-PLAY DATA EXPORTERS (ZERO `if/else`)
+---------------------------------------------------------------
+- `exporters/ExporterRegistry.py`:
+  Implements `@ExporterRegistry.register("name")` and `discover_plugins()` via `pkgutil.iter_modules`. Instantiates all exporters listed in `Config.ACTIVE_EXPORTERS` via dictionary lookup without `if/else`.
+- `exporters/ExportPipeline.py`:
+  Formats chronological events, per-camera passages (`CAMERA_PASSAGE`), and cluster summaries (`AMBIENTE_SUMMARY`), dispatches real-time events via `notify_event(event)`, and dispatches final consolidated records via `export_all(identities, events)`.
+- `exporters/CsvTrajectoryExporter.py`:
+  Registered as `@ExporterRegistry.register("csv")`. Writes consolidated records to `tracking_data_final.csv`.
+- `exporters/KafkaEventExporter.py`:
+  Registered as `@ExporterRegistry.register("kafka")`. Publishes JSON tracking events in real time (`on_event`) and consolidated summaries (`export`) to `Config.KAFKA_EVENTS_TOPIC` using `confluent_kafka.Producer`.
+
+F. `identity/` — CROSS-CAMERA RE-ID & TOPOLOGY CLUSTERING
+---------------------------------------------------------
+- `identity/CameraClusterManager.py`:
+  Thread-safe wrapper around `scipy.cluster.hierarchy.DisjointSet` (Union-Find) that merges cameras into shared spatial `Ambientes` when a person transitions between them within `AUTO_CLUSTER_TIME_THRESHOLD`.
+- `identity/GlobalIdentityManager.py`:
+  Manages intra-camera and cross-camera Re-ID matching (`get_or_create_global_id`, `update_existing_identity`), spatial-temporal proximity bonuses, online provisional identity consolidation, and event dispatching to `ExportPipeline`.
+- `identity/IdentityManagerServer.py`:
+  `BaseManager` RPC server used when `EXECUTION_MODE = "multiprocess"`.
+- `identity/runtime_setup.py`:
+  Configures OpenMP/MKL/OpenCV threads and PyTorch cuDNN/TF32 flags.
+
+G. `vision/` — YOLO26n, TORCHVISION RE-ID & `deep-sort-realtime`
+----------------------------------------------------------------
+- `vision/GraphSlot.py`:
+  Encapsulates static GPU tensors and double-buffered page-locked (`pin_memory=True`) host buffers for a specific camera batch size `B`.
+- `vision/BatchInferenceEngine.py`:
+  Fuses Ultralytics `YOLO26n` (`one2one` head), suppresses non-person and furniture classes (`56..62`: chairs, couches, tables, TVs) on GPU, crops detected people via `torchvision.ops.roi_align`, extracts 576D embeddings via `MobileNetV3-Small` inside a captured `torch.cuda.CUDAGraph`, and filters boxes with `torchvision.ops.nms` and `torchvision.ops.box_iou`.
+- `vision/featureExtractor.py`:
+  Computes 576D L2-normalized embeddings fusing deep semantic stripes, mid-level texture stripes, and Gray-World white-balanced color/chromaticity stripes.
+- `vision/StabilizedTrack.py`:
+  Subclass of `deep_sort_realtime.deep_sort.track.Track` (injected via `override_track_class=StabilizedTrack`) adding occlusion velocity damping, tentative-track 1-frame blink survival (`mark_missed`), EMA bounding-box smoothing, and outlier-filtered EMA appearance updates.
+- `vision/cameraWorker.py`:
+  Per-camera worker that runs `deep_sort_realtime.deepsort_tracker.DeepSort`, suppresses duplicate overlapping tracks via `torchvision.ops.box_iou`, resolves Global IDs with `GlobalIdentityManager`, evaluates behavior plugins via `BehaviorPipeline`, and annotates frames.
+
+H. `extraction/` & `ui/` — VIDEO STREAM CAPTURE & PRESENTATION
+--------------------------------------------------------------
+- `extraction/FrameReaderManagement.py`:
+  Orchestrates background `FrameReaderInvoker` threads and the double-buffered GPU/CPU loop (overlapping GPU Batch `t` with CPU tracking for Batch `t-1`).
+- `extraction/CameraProcess.py`:
+  Worker process entrypoint for `"multiprocess"` mode.
+- `extraction/frameReaderCommand/`:
+  Command Pattern implementations (`ReadRTSPCommand.py`, `ReadKafkaCommand.py`), factories (`RTSPCommandFactory.py`, `KafkaCommandFactory.py`), and background thread invoker (`FrameReaderInvoker.py`).
+- `ui/display.py`:
+  OpenCV HUD drawing functions (`draw_annotation_spec`, `draw_camera_hud`) and `MultiCameraDisplay` window manager.

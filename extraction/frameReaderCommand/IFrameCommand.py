@@ -1,4 +1,4 @@
 # extraction/frameReaderCommand/IFrameCommand.py
-from core.ports import IFrameCommand
+from interfaces.IFrameCommand import IFrameCommand
 
 __all__ = ["IFrameCommand"]

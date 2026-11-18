@@ -8,19 +8,9 @@ from extraction.frameReaderCommand.IFrameCommand import IFrameCommand
 
 
 class FrameReaderInvoker(threading.Thread):
-    """
-    Command Invoker (Command Pattern) that continuously executes an IFrameCommand
-    on a dedicated background I/O thread and maintains only the freshest frame per camera.
-    Prevents queue buildup and latency drift when capture and inference run at different rates.
-    """
+    """Background I/O thread that executes an `IFrameCommand` and keeps the freshest frame per camera."""
 
-    def __init__(
-        self,
-        cam_key: str,
-        command: IFrameCommand,
-        stop_event: threading.Event,
-        name: str = "FrameReaderInvoker",
-    ):
+    def __init__(self, cam_key: str, command: IFrameCommand, stop_event: threading.Event, name: str = "FrameReaderInvoker"):
         super().__init__(daemon=True, name=name)
         self.cam_key = cam_key
         self.command = command
@@ -30,36 +20,31 @@ class FrameReaderInvoker(threading.Thread):
         self._cached_frames: dict[str, np.ndarray] = {}
         self._seq_id = 0
 
+    def _store_frames(self, batch: dict[str, np.ndarray]) -> None:
+        with self._lock:
+            self._latest_frames.update(batch)
+            self._cached_frames.update(batch)
+            self._seq_id += 1
+
+    def _step_capture(self, has_batch_exec: bool) -> None:
+        if has_batch_exec:
+            batch = self.command.execute_batch()
+            if batch:
+                self._store_frames(batch)
+            return
+        res = self.command.execute()
+        if res is not None:
+            self._store_frames({res[0]: res[1]})
+
     def run(self) -> None:
         logging.info(f"[{self.name}] Iniciando loop de captura para '{self.cam_key}'...")
         has_batch_exec = hasattr(self.command, "execute_batch")
-
         while not self.stop_event.is_set():
-            if has_batch_exec:
-                batch = self.command.execute_batch()
-                if batch:
-                    with self._lock:
-                        for cam_id, frame in batch.items():
-                            self._latest_frames[cam_id] = frame
-                            self._cached_frames[cam_id] = frame
-                        self._seq_id += 1
-            else:
-                result = self.command.execute()
-                if result is not None:
-                    cam_id, frame = result
-                    with self._lock:
-                        self._latest_frames[cam_id] = frame
-                        self._cached_frames[cam_id] = frame
-                        self._seq_id += 1
-
+            self._step_capture(has_batch_exec)
         logging.info(f"[{self.name}] Thread encerrada. Executando limpeza...")
         self.command.cleanup()
 
     def get_latest(self) -> Optional[dict[str, np.ndarray]]:
-        """
-        Consume and return the dictionary of newly arrived frames since the last call.
-        Returns None if no new frame has been decoded yet.
-        """
         with self._lock:
             if not self._latest_frames:
                 return None
@@ -68,11 +53,6 @@ class FrameReaderInvoker(threading.Thread):
             return result
 
     def get_batch_state(self) -> tuple[Optional[dict[str, np.ndarray]], set[str]]:
-        """
-        Return (all_cached_frames_copy, newly_updated_cam_ids).
-        Ensures every active camera is included in every GPU batch while tracking which
-        cameras received a fresh frame from the stream since the previous call.
-        """
         with self._lock:
             if not self._cached_frames:
                 return None, set()
@@ -81,15 +61,9 @@ class FrameReaderInvoker(threading.Thread):
             return {cid: frm.copy() for cid, frm in self._cached_frames.items()}, new_cams
 
     def get_latest_with_fallback(self) -> tuple[Optional[dict[str, np.ndarray]], bool]:
-        """
-        Return (frames_dict, is_new). If a new frame arrived, consumes it and returns (frames, True).
-        Otherwise returns the most recently cached frame (frames, False) so multi-camera batching
-        never stalls waiting on a slower camera stream.
-        """
         with self._lock:
-            if self._latest_frames:
-                self._latest_frames.clear()
-                return {cid: frm.copy() for cid, frm in self._cached_frames.items()}, True
-            if self._cached_frames:
-                return {cid: frm.copy() for cid, frm in self._cached_frames.items()}, False
-            return None, False
+            is_new = bool(self._latest_frames)
+            self._latest_frames.clear()
+            if not self._cached_frames:
+                return None, False
+            return {cid: frm.copy() for cid, frm in self._cached_frames.items()}, is_new
