@@ -11,7 +11,8 @@ class CsvTrajectoryExporter(IDataExporter):
 
     CSV_FIELDS = [
         "event_index", "event_type", "global_id", "camera_id", "origin_camera", "next_camera",
-        "ambiente_id", "merged_cameras", "cameras_path", "timestamp_in", "timestamp_out",
+        "ambiente_id", "merged_cameras", "cameras_path", "people_in_camera", "object_class",
+        "confidence_pct", "reid_similarity_pct", "timestamp_in", "timestamp_out",
         "datetime_in", "datetime_out", "duration_seconds", "stopped_seconds", "reid_distance", "details",
     ]
 

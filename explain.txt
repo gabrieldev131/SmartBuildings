@@ -1,5 +1,5 @@
 ================================================================================
-SMARTBUILDINGS MULTI-CAMERA VISION, TRACKING & RE-IDENTIFICATION SYSTEM
+SMARTBUILDINGS MULTI-CAMERA VISION, TRACKING, RE-ID & KAFKA TELEMETRY SYSTEM
 TECHNICAL ARCHITECTURE, S.O.L.I.D. DESIGN PATTERNS & MODULE REFERENCE
 File: explain.txt
 ================================================================================
@@ -13,10 +13,10 @@ Every Python module in the project enforces two strict structural rules:
 How the S.O.L.I.D. Principles are implemented across the folders:
 - [S] Single Responsibility Principle (SRP):
   Every package and class has a single well-defined responsibility:
-  * `domain/` holds pure data structures and the `GlobalIdentity` entity.
+  * `domain/` holds pure data structures (`BoundingBox`, `FramePacket`, `TrackContext`, `BehaviorResult`, `AnnotationSpec`) and the `GlobalIdentity` entity.
   * `interfaces/` holds pure abstract contracts (`ABC`), one per file.
-  * `behaviors/` holds self-contained behavioral plugins (`StoppedStateTracker`, `RestrictedZoneAnalyzer`).
-  * `exporters/` holds self-contained data sinks (`CsvTrajectoryExporter`, `KafkaEventExporter`).
+  * `behaviors/` holds self-contained behavioral and telemetry plugins (`StoppedStateTracker`, `RestrictedZoneAnalyzer`, `CalmaNathaliaProducer`).
+  * `exporters/` holds self-contained data sinks (`CsvTrajectoryExporter`, `KafkaEventExporter` publishing to topic `"Calma_Nathalia"`).
   * `identity/` holds cross-camera identity resolution (`GlobalIdentityManager`) and topology (`CameraClusterManager`).
   * `extraction/` holds asynchronous video stream capture (`RTSP`, `MP4`, `Kafka`).
   * `vision/` holds GPU detection (`BatchInferenceEngine`), feature extraction (`featureExtractor`), and per-camera tracking (`CameraWorker`, `StabilizedTrack`).
@@ -29,7 +29,7 @@ How the S.O.L.I.D. Principles are implemented across the folders:
 - [L] Liskov Substitution Principle (LSP):
   * `ReadRTSPCommand` and `ReadKafkaCommand` are interchangeable implementations of `IFrameCommand`.
   * `CsvTrajectoryExporter` and `KafkaEventExporter` are interchangeable implementations of `IDataExporter`.
-  * `StoppedStateTracker` and `RestrictedZoneAnalyzer` are interchangeable implementations of `IBehaviorAnalyzer`.
+  * `StoppedStateTracker`, `RestrictedZoneAnalyzer`, and `CalmaNathaliaProducer` are interchangeable implementations of `IBehaviorAnalyzer`.
   * `StabilizedTrack` is a behavioral subtype of `deep_sort_realtime.deep_sort.track.Track`.
 
 - [I] Interface Segregation Principle (ISP):
@@ -50,19 +50,22 @@ A. ROOT CONFIGURATION & ENTRYPOINT
 - `Config.py`:
   Centralizes all system parameters:
   * Hardware & execution: `USE_GPU`, `EXECUTION_MODE` (`"batched"` or `"multiprocess"`), `USE_CUDA_GRAPHS`, `MAX_DETECTIONS_PER_CAMERA = 18`.
-  * YOLO26n detection & chair/furniture filtering: `YOLO_CONF_THRESHOLD = 0.40`, `YOLO_INIT_CONF = 0.48`, `MIN_ASPECT_RATIO = 0.18`, `MAX_ASPECT_RATIO = 0.95`.
+  * YOLO26n detection, class selection & chair/furniture filtering: `YOLO_TARGET_CLASSES = (0,)`, `YOLO_CONF_THRESHOLD = 0.40`, `YOLO_INIT_CONF = 0.48`, `YOLO_CONF_LOW = 0.34`, `YOLO_IOU_THRESHOLD = 0.50`, `MIN_ASPECT_RATIO = 0.18`, `MAX_ASPECT_RATIO = 0.95`.
   * `deep-sort-realtime` parameters: `DEEPSORT_MAX_AGE = 90`, `DEEPSORT_N_INIT = 2`, `DEEPSORT_MAX_COSINE_DISTANCE = 0.40`, `DEEPSORT_MAX_IOU_DISTANCE = 0.72`.
-  * Active Behavior Plugins tuple: `ACTIVE_BEHAVIORS = ("stopped",)`.
-  * Active Data Exporters tuple: `ACTIVE_EXPORTERS = ("csv",)` (add `"kafka"` to stream events to Kafka).
+  * Active Behavior Plugins tuple: `ACTIVE_BEHAVIORS = ("stopped", "calma_nathalia")`.
+  * Active Data Exporters tuple & Kafka Topic: `ACTIVE_EXPORTERS = ("csv", "kafka")`, `KAFKA_EVENTS_TOPIC = "Calma_Nathalia"`, `KAFKA_TELEMETRY_INTERVAL_SEC = 0.25`.
 
 B. `domain/` — DOMAIN ENTITIES & VALUE OBJECTS
 ----------------------------------------------
 - `domain/BoundingBox.py`: Dataclass encapsulating `[x1, y1, x2, y2]` and geometric properties (`width`, `height`, `area`, `aspect_ratio`, `center`).
 - `domain/FramePacket.py`: Dataclass encapsulating `(cam_id, frame, timestamp, seq_id)`.
-- `domain/TrackContext.py`: Dataclass passed to every `IBehaviorAnalyzer` on each frame (`global_id`, `local_id`, `cam_id`, `bbox`, `current_time`, `confidence`).
-- `domain/BehaviorResult.py`: Dataclass returned by `IBehaviorAnalyzer.analyze(...)` specifying `name`, `is_active`, `label_suffix`, `color_override`, `event_type`, `duration_seconds`, and `details`.
+- `domain/TrackContext.py`: Rich per-frame context passed to every `IBehaviorAnalyzer` plugin. Encapsulates:
+  * Identifiers & object class: `global_id`, `local_id`, `cam_id`, `object_class`, `class_id`, `bbox`, `current_time`, `confidence`.
+  * Camera crowd & track metrics: `people_in_camera`, `total_tracks_in_camera`, `confirmed_tracks_in_camera`, `tentative_tracks_in_camera`, `coasting_tracks_in_camera`, `yolo_detections_in_camera`, `yolo_raw_candidates_in_camera`, `camera_fps`, `frame_number`, `frame_width`, `frame_height`.
+  * Nested dictionaries: `yolo_metrics` (all YOLO detection data), `deepsort_metrics` (all DeepSort & 8D Kalman Filter data), `limiares_percentuais` (all live percentage scores and configured percentage thresholds), plus `camera_summary()` and `to_telemetry_dict()` methods.
+- `domain/BehaviorResult.py`: Dataclass returned by `IBehaviorAnalyzer.analyze(...)` specifying `name`, `is_active`, `label_suffix`, `color_override`, `event_type`, `duration_seconds`, `details`, and `telemetry` (`dict`).
 - `domain/AnnotationSpec.py`: Dataclass holding the resolved HUD `bbox`, `global_id`, `label`, and `color`.
-- `domain/GlobalIdentity.py`: Domain entity for a unique person across cameras. Uses `scipy.spatial.distance.cdist` for hybrid cosine matching across a multi-pose gallery, per-camera EMA memory, and global EMA centroid, with outlier rejection and diversity-preserving updates.
+- `domain/GlobalIdentity.py`: Domain entity for a unique person across cameras. Uses `scipy.spatial.distance.cdist` for hybrid cosine matching across a multi-pose gallery, per-camera EMA memory, and global EMA centroid.
 
 C. `interfaces/` — APPLICATION PORTS (ABCs)
 -------------------------------------------
@@ -73,34 +76,36 @@ C. `interfaces/` — APPLICATION PORTS (ABCs)
 - `interfaces/IIdentityRepository.py`: Contract for `GlobalIdentityManager`.
 - `interfaces/IStateTracker.py`: Contract for `update_and_evaluate(global_id, box, current_time)`.
 
-D. `behaviors/` — PLUG-AND-PLAY BEHAVIORAL ANALYTICS (ZERO `if/else`)
----------------------------------------------------------------------
+D. `behaviors/` — PLUG-AND-PLAY BEHAVIORAL & TELEMETRY ANALYTICS (ZERO `if/else`)
+---------------------------------------------------------------------------------
 - `behaviors/BehaviorRegistry.py`:
   Implements `@BehaviorRegistry.register("name")` and `discover_plugins()` via `pkgutil.iter_modules`. Instantiates all plugins listed in `Config.ACTIVE_BEHAVIORS` via dictionary lookup without `if/else`.
 - `behaviors/BehaviorPipeline.py`:
-  Composite runner that evaluates all active `IBehaviorAnalyzer` plugins on each person's `TrackContext`, builds the HUD `AnnotationSpec`, and forwards active events to `GlobalIdentityManager.record_behavior_event`.
+  Composite runner that evaluates all active `IBehaviorAnalyzer` plugins on each person's `TrackContext`, builds the HUD `AnnotationSpec`, and forwards active events and `telemetry` payloads (`result.telemetry or context.to_telemetry_dict()`) to `GlobalIdentityManager.record_behavior_event`.
 - `behaviors/StoppedStateTracker.py`:
   Registered as `@BehaviorRegistry.register("stopped")`. Uses a sliding time deque and spatial hysteresis (`STOPPED_PIXEL_THRESHOLD`, `MOVEMENT_BREAKOUT_THRESHOLD`) to detect stationary/loitering people.
 - `behaviors/RestrictedZoneAnalyzer.py`:
   Registered as `@BehaviorRegistry.register("restricted_zone")`. Alerts whenever a person enters a normalized bounding region.
+- `behaviors/Calma_NathaliaProducer.py`:
+  Registered as `@BehaviorRegistry.register("calma_nathalia")`. Extracts the complete telemetry dictionary from `TrackContext` (`people_in_camera`, `object_class`, `class_id`, `limiares_percentuais`, `yolo`, `deepsort`, `camera_summary`) and emits `CALMA_NATHALIA_TELEMETRY` events immediately on new detections, whenever the camera's people count changes, or at `KAFKA_TELEMETRY_INTERVAL_SEC` intervals for publication to Kafka topic `"Calma_Nathalia"`.
 
 E. `exporters/` — PLUG-AND-PLAY DATA EXPORTERS (ZERO `if/else`)
 ---------------------------------------------------------------
 - `exporters/ExporterRegistry.py`:
   Implements `@ExporterRegistry.register("name")` and `discover_plugins()` via `pkgutil.iter_modules`. Instantiates all exporters listed in `Config.ACTIVE_EXPORTERS` via dictionary lookup without `if/else`.
 - `exporters/ExportPipeline.py`:
-  Formats chronological events, per-camera passages (`CAMERA_PASSAGE`), and cluster summaries (`AMBIENTE_SUMMARY`), dispatches real-time events via `notify_event(event)`, and dispatches final consolidated records via `export_all(identities, events)`.
+  Formats chronological events, per-camera passages (`CAMERA_PASSAGE`), and cluster summaries (`AMBIENTE_SUMMARY`), preserving all YOLO, DeepSort, Camera Occupancy, Object Class, and Percentage Threshold fields, and dispatches real-time events via `notify_event(event)` and final consolidated records via `export_all(identities, events)`.
 - `exporters/CsvTrajectoryExporter.py`:
-  Registered as `@ExporterRegistry.register("csv")`. Writes consolidated records to `tracking_data_final.csv`.
+  Registered as `@ExporterRegistry.register("csv")`. Writes consolidated records (including `people_in_camera`, `object_class`, `confidence_pct`, `reid_similarity_pct`) to `tracking_data_final.csv`.
 - `exporters/KafkaEventExporter.py`:
-  Registered as `@ExporterRegistry.register("kafka")`. Publishes JSON tracking events in real time (`on_event`) and consolidated summaries (`export`) to `Config.KAFKA_EVENTS_TOPIC` using `confluent_kafka.Producer`.
+  Registered as `@ExporterRegistry.register("kafka")`. Publishes JSON tracking events and rich YOLO+DeepSort telemetry in real time (`on_event`) and consolidated summaries (`export`) to Kafka topic `"Calma_Nathalia"` (`Config.KAFKA_EVENTS_TOPIC`) using `confluent_kafka.Producer`.
 
 F. `identity/` — CROSS-CAMERA RE-ID & TOPOLOGY CLUSTERING
 ---------------------------------------------------------
 - `identity/CameraClusterManager.py`:
   Thread-safe wrapper around `scipy.cluster.hierarchy.DisjointSet` (Union-Find) that merges cameras into shared spatial `Ambientes` when a person transitions between them within `AUTO_CLUSTER_TIME_THRESHOLD`.
 - `identity/GlobalIdentityManager.py`:
-  Manages intra-camera and cross-camera Re-ID matching (`get_or_create_global_id`, `update_existing_identity`), spatial-temporal proximity bonuses, online provisional identity consolidation, and event dispatching to `ExportPipeline`.
+  Manages intra-camera and cross-camera Re-ID matching (`get_or_create_global_id`, `update_existing_identity`), caches per-camera and per-identity telemetry, enriches all logged events with Re-ID similarity percentages (`reid_similarity_pct`, `reid_distance_pct`), cluster topology (`ambiente_id`, `merged_cameras`, `cameras_path`), camera occupancy (`people_in_camera`), `object_class`, `limiares_percentuais`, `yolo`, and `deepsort` structures, and dispatches them to `ExportPipeline`.
 - `identity/IdentityManagerServer.py`:
   `BaseManager` RPC server used when `EXECUTION_MODE = "multiprocess"`.
 - `identity/runtime_setup.py`:
@@ -111,21 +116,51 @@ G. `vision/` — YOLO26n, TORCHVISION RE-ID & `deep-sort-realtime`
 - `vision/GraphSlot.py`:
   Encapsulates static GPU tensors and double-buffered page-locked (`pin_memory=True`) host buffers for a specific camera batch size `B`.
 - `vision/BatchInferenceEngine.py`:
-  Fuses Ultralytics `YOLO26n` (`one2one` head), suppresses non-person and furniture classes (`56..62`: chairs, couches, tables, TVs) on GPU, crops detected people via `torchvision.ops.roi_align`, extracts 576D embeddings via `MobileNetV3-Small` inside a captured `torch.cuda.CUDAGraph`, and filters boxes with `torchvision.ops.nms` and `torchvision.ops.box_iou`.
+  Fuses Ultralytics `YOLO26n` (`one2one` head), preserves COCO class IDs and names (`yolo.names`, configurable via `YOLO_TARGET_CLASSES`), suppresses furniture false positives on GPU, crops detected objects via `torchvision.ops.roi_align`, extracts 576D embeddings via `MobileNetV3-Small` inside a captured `torch.cuda.CUDAGraph`, and tracks raw candidate counts and class IDs per camera.
 - `vision/featureExtractor.py`:
   Computes 576D L2-normalized embeddings fusing deep semantic stripes, mid-level texture stripes, and Gray-World white-balanced color/chromaticity stripes.
 - `vision/StabilizedTrack.py`:
-  Subclass of `deep_sort_realtime.deep_sort.track.Track` (injected via `override_track_class=StabilizedTrack`) adding occlusion velocity damping, tentative-track 1-frame blink survival (`mark_missed`), EMA bounding-box smoothing, and outlier-filtered EMA appearance updates.
+  Subclass of `deep_sort_realtime.deep_sort.track.Track` (injected via `override_track_class=StabilizedTrack`) adding occlusion velocity damping, tentative-track blink survival, EMA bounding-box smoothing, outlier-filtered EMA appearance updates, and two telemetry extraction methods:
+  * `extract_yolo_metrics(frame_w, frame_h, is_near_border, model_path)`: extracts `object_class`, `class_id`, `confidence`, `confidence_pct`, `max_confidence`, `max_confidence_pct`, `bbox_xyxy`, `bbox_ltwh`, `raw_bbox_ltwh`, `center_xy`, `center_norm`, `width`, `height`, `area_px`, `area_pct`, `aspect_ratio`, `is_near_border`, and `model_path`.
+  * `extract_deepsort_metrics(global_id, fps)`: extracts `local_track_id`, `global_id`, `track_state`, `is_confirmed`, `is_tentative`, `hits`, `age`, `time_since_update`, `is_coasting`, `is_isolated`, `velocity_vx`, `velocity_vy`, `speed_px_per_frame`, `speed_px_per_sec`, `movement_direction_deg`, `kalman_mean_8d`, `kalman_bbox_ltrb`, `smoothed_bbox_ltrb`, `position_uncertainty`, `velocity_uncertainty`, `appearance_similarity_pct`, `embedding_dim`, `embedding_norm`, and `gallery_size`.
 - `vision/cameraWorker.py`:
-  Per-camera worker that runs `deep_sort_realtime.deepsort_tracker.DeepSort`, suppresses duplicate overlapping tracks via `torchvision.ops.box_iou`, resolves Global IDs with `GlobalIdentityManager`, evaluates behavior plugins via `BehaviorPipeline`, and annotates frames.
+  Per-camera worker that runs `DeepSort`, computes camera-wide track counts (`people_in_camera`, `total_tracks`, `confirmed_tracks`, `tentative_tracks`, `coasting_tracks`, `yolo_detections`, `yolo_raw_candidates`), builds `limiares_percentuais` and `TrackContext`, evaluates behavior plugins via `BehaviorPipeline`, and annotates frames.
 
 H. `extraction/` & `ui/` — VIDEO STREAM CAPTURE & PRESENTATION
 --------------------------------------------------------------
 - `extraction/FrameReaderManagement.py`:
-  Orchestrates background `FrameReaderInvoker` threads and the double-buffered GPU/CPU loop (overlapping GPU Batch `t` with CPU tracking for Batch `t-1`).
+  Orchestrates background `FrameReaderInvoker` threads and the double-buffered GPU/CPU loop.
 - `extraction/CameraProcess.py`:
   Worker process entrypoint for `"multiprocess"` mode.
 - `extraction/frameReaderCommand/`:
   Command Pattern implementations (`ReadRTSPCommand.py`, `ReadKafkaCommand.py`), factories (`RTSPCommandFactory.py`, `KafkaCommandFactory.py`), and background thread invoker (`FrameReaderInvoker.py`).
 - `ui/display.py`:
   OpenCV HUD drawing functions (`draw_annotation_spec`, `draw_camera_hud`) and `MultiCameraDisplay` window manager.
+
+
+3. KAFKA TOPIC "Calma_Nathalia" & COMPLETE YOLO + DEEPSORT TELEMETRY REFERENCE
+------------------------------------------------------------------------------
+All events and real-time telemetry are published as UTF-8 JSON messages to the Kafka topic `"Calma_Nathalia"` (partitioned by `camera_id`). Each JSON payload includes:
+
+1. `people_in_camera` & `camera_summary`:
+   - `people_in_camera`: Active confirmed people currently tracked in the camera.
+   - `total_tracks_in_camera`, `confirmed_tracks_in_camera`, `tentative_tracks_in_camera`, `coasting_tracks_in_camera`.
+   - `yolo_detections_in_camera`, `yolo_raw_candidates_in_camera`.
+   - `camera_fps`, `frame_number`, `frame_width`, `frame_height`, `camera_occupancy_pct`.
+
+2. `object_class` & `yolo`:
+   - `object_class` (e.g., `"person"`) and `class_id` (e.g., `0`).
+   - `confidence`, `confidence_pct`, `max_confidence`, `max_confidence_pct`.
+   - `bbox_xyxy`, `bbox_ltwh`, `raw_bbox_ltwh`, `center_xy`, `center_norm`.
+   - `width`, `height`, `area_px`, `area_pct`, `aspect_ratio`, `is_near_border`, `model_path`.
+
+3. `limiares_percentuais` (Live Percentage Scores & Configured Percentage Thresholds):
+   - Live percentages: `yolo_confidence_pct`, `yolo_max_confidence_pct`, `yolo_margin_above_threshold_pct`, `bbox_frame_area_pct`, `deepsort_appearance_similarity_pct`, `camera_occupancy_pct`, `reid_similarity_pct`, `reid_distance_pct`.
+   - Configured thresholds (%): `yolo_conf_threshold_pct`, `yolo_init_conf_threshold_pct`, `yolo_conf_low_threshold_pct`, `yolo_iou_threshold_pct`, `deepsort_max_cosine_distance_pct`, `deepsort_max_iou_distance_pct`, `deepsort_nms_max_overlap_pct`, `reid_intra_camera_threshold_pct`, `reid_inter_camera_threshold_pct`, `reid_simultaneous_threshold_pct`.
+
+4. `deepsort` (DeepSort Lifecycle & 8D Kalman Filter State):
+   - `local_track_id`, `global_id`, `track_state`, `is_confirmed`, `is_tentative`, `hits`, `age`, `time_since_update`, `is_coasting`, `is_isolated`.
+   - `velocity_vx`, `velocity_vy`, `speed_px_per_frame`, `speed_px_per_sec`, `movement_direction_deg`.
+   - `kalman_mean_8d` (`[cx, cy, a, h, vx, vy, va, vh]`), `kalman_bbox_ltrb`, `smoothed_bbox_ltrb`.
+   - `position_uncertainty` (`Tr(Cov_pos)`), `velocity_uncertainty` (`Tr(Cov_vel)`).
+   - `appearance_similarity_pct`, `embedding_dim` (`576`), `embedding_norm`, `gallery_size`.

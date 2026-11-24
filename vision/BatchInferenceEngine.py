@@ -15,7 +15,7 @@ from vision.GraphSlot import GraphSlot
 
 
 class BatchInferenceEngine:
-    """Centralized multi-camera person detection and Re-ID feature extraction engine (SRP)."""
+    """Centralized multi-camera object detection and Re-ID feature extraction engine (SRP)."""
 
     def __init__(self, config):
         self.config = config
@@ -28,6 +28,9 @@ class BatchInferenceEngine:
         self.conf_low, self.iou_thresh = getattr(config, "YOLO_CONF_LOW", 0.35), getattr(config, "YOLO_IOU_THRESHOLD", 0.50)
         self.min_w, self.min_h = float(getattr(config, "MIN_BOX_WIDTH", 16)), float(getattr(config, "MIN_BOX_HEIGHT", 34))
         self.min_ar, self.max_ar = float(getattr(config, "MIN_ASPECT_RATIO", 0.18)), float(getattr(config, "MAX_ASPECT_RATIO", 0.95))
+        self.class_names: dict[int, str] = {0: "person"}
+        self.last_raw_total: int = 0
+        self.last_class_ids_list: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._stream = torch.cuda.Stream(device=self.device) if self.use_gpu else None
         self.net = self._init_yolo_detector()
@@ -37,24 +40,31 @@ class BatchInferenceEngine:
 
     def _init_yolo_detector(self) -> torch.nn.Module:
         yolo = YOLO(self.config.YOLO_MODEL_PATH, task="detect", verbose=False)
+        self.class_names = dict(getattr(yolo, "names", {0: "person"}))
+        target_cls = tuple(int(c) for c in getattr(self.config, "YOLO_TARGET_CLASSES", (0,))) or (0,)
         dummy = torch.zeros((1, 3, self.height, self.width), device=self.device, dtype=self._dtype)
         yolo.predict(dummy, device=self.device, half=self.use_gpu, verbose=False)
         net = yolo.model.to(self.device, dtype=self._dtype).eval()
         head = net.model[-1]
-        head.postprocess = lambda preds: self._person_only_postprocess(preds, head.nc, self.max_dets)
+        head.postprocess = lambda preds: self._postprocess_predictions(preds, head.nc, self.max_dets, target_cls)
         return net
 
     @staticmethod
-    def _person_only_postprocess(preds: torch.Tensor, nc: int, max_dets: int) -> torch.Tensor:
+    def _postprocess_predictions(preds: torch.Tensor, nc: int, max_dets: int, target_classes: tuple[int, ...]) -> torch.Tensor:
         boxes, scores = preds.split([4, nc], dim=-1)
-        person_scores = scores[..., 0:1]
-        other_max = scores[..., 1:].amax(dim=-1, keepdim=True)
-        furniture_max = scores[..., 56:63].amax(dim=-1, keepdim=True)
-        valid = (person_scores >= other_max * 1.6) & ((furniture_max <= 0.08) | (person_scores >= 0.75))
-        person_scores = torch.where(valid, person_scores, torch.zeros_like(person_scores))
-        top_scores, idx = person_scores.topk(max_dets, dim=1)
-        top_boxes = boxes.gather(dim=1, index=idx.expand(-1, -1, 4))
-        return torch.cat([top_boxes, top_scores, torch.zeros_like(top_scores)], dim=-1)
+        if target_classes == (0,):
+            p_scores = scores[..., 0:1]
+            valid = (p_scores >= scores[..., 1:].amax(dim=-1, keepdim=True) * 1.6) & ((scores[..., 56:63].amax(dim=-1, keepdim=True) <= 0.08) | (p_scores >= 0.75))
+            cls_scores, cls_ids = torch.where(valid, p_scores, torch.zeros_like(p_scores)), torch.zeros_like(p_scores)
+        else:
+            t_idx = torch.tensor(target_classes, device=scores.device, dtype=torch.long)
+            cls_scores, sub_arg = scores.index_select(-1, t_idx).max(dim=-1, keepdim=True)
+            cls_ids = t_idx[sub_arg].to(scores.dtype)
+        top_scores, idx = cls_scores.topk(max_dets, dim=1)
+        return torch.cat([boxes.gather(1, idx.expand(-1, -1, 4)), top_scores, cls_ids.gather(1, idx)], dim=-1)
+
+    def get_class_name(self, class_id: int) -> str:
+        return str(self.class_names.get(int(class_id), "person"))
 
     def _init_reid_backbone(self) -> None:
         self.backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT).features.to(self.device, dtype=self._dtype).eval()
@@ -127,28 +137,31 @@ class BatchInferenceEngine:
         self._execute_slot_on_device(slot, p_in, buf_idx)
         return slot, buf_idx
 
-    def _filter_single_camera(self, c_dets: np.ndarray, c_feats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _filter_single_camera(self, c_dets: np.ndarray, c_feats: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         x1, y1 = np.clip(c_dets[:, 0], 0.0, self.width), np.clip(c_dets[:, 1], 0.0, self.height)
         x2, y2 = np.clip(c_dets[:, 2], 0.0, self.width), np.clip(c_dets[:, 3], 0.0, self.height)
-        confs, w, h = c_dets[:, 4], x2 - x1, y2 - y1
+        confs, cls_ids, w, h = c_dets[:, 4], c_dets[:, 5].astype(np.int32), x2 - x1, y2 - y1
         ar, area = w / np.maximum(1.0, h), w * h
+        self.last_raw_total = int(np.sum(confs >= (self.conf_low * 0.5)))
         sliver = ((x1 <= 3.0) | (x2 >= self.width - 3.0)) & (w < 22.0) & (confs < 0.58)
         valid = (confs >= self.conf_low) & (w >= self.min_w) & (h >= self.min_h) & (ar >= self.min_ar) & (ar <= self.max_ar) & (area <= float(self.width * self.height) * 0.60) & (~sliver)
         if not np.any(valid):
-            return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32), np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+            return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32), np.empty((0, EMBEDDING_DIM), dtype=np.float32), np.empty((0,), dtype=np.int32)
         v_boxes = np.column_stack((x1[valid], y1[valid], x2[valid], y2[valid])).astype(np.float32)
-        v_confs, v_feats = confs[valid].astype(np.float32), c_feats[valid].copy()
+        v_confs, v_feats, v_cls = confs[valid].astype(np.float32), c_feats[valid].copy(), cls_ids[valid]
         if len(v_boxes) > 1:
             keep = self._filter_boxes_torchvision(v_boxes, v_confs)
-            v_boxes, v_confs, v_feats = v_boxes[keep], v_confs[keep], v_feats[keep]
-        return v_boxes, v_confs, v_feats
+            v_boxes, v_confs, v_feats, v_cls = v_boxes[keep], v_confs[keep], v_feats[keep], v_cls[keep]
+        return v_boxes, v_confs, v_feats, v_cls
 
     def synchronize_and_filter(self, slot: GraphSlot, buf_idx: int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         if self._stream is not None:
             self._stream.synchronize()
         dets_b = slot.pinned_dets[buf_idx].numpy()
         feats_b = slot.pinned_feats[buf_idx].numpy()
-        return [self._filter_single_camera(dets_b[c], feats_b[c]) for c in range(slot.batch_size)]
+        filtered = [self._filter_single_camera(dets_b[c], feats_b[c]) for c in range(slot.batch_size)]
+        self.last_class_ids_list = [f[3] for f in filtered]
+        return [(f[0], f[1], f[2]) for f in filtered]
 
     def _filter_boxes_torchvision(self, boxes: np.ndarray, scores: np.ndarray) -> np.ndarray:
         boxes_t, scores_t = torch.from_numpy(boxes), torch.from_numpy(scores)

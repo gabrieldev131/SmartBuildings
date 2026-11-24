@@ -1,6 +1,6 @@
 # domain/BehaviorResult.py
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 
 @dataclass(slots=True)
@@ -13,3 +13,4 @@ class BehaviorResult:
     event_type: Optional[str] = None
     duration_seconds: float = 0.0
     details: str = ""
+    telemetry: dict[str, Any] = field(default_factory=dict)

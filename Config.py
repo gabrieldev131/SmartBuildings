@@ -14,6 +14,7 @@ class Config:
 
     # === YOLO DETECTION PARAMETERS (ultralytics + torchvision) ===
     YOLO_MODEL_PATH = "models/yolo26n.pt"
+    YOLO_TARGET_CLASSES = (0,)       # COCO class IDs to detect (0 = "person"; add others if needed)
     YOLO_CONF_THRESHOLD = 0.40       # Confidence threshold for person tracking
     YOLO_INIT_CONF = 0.48            # Minimum confidence required to confirm a brand-new person track
     YOLO_CONF_LOW = 0.34             # Minimum confidence kept after GPU post-processing
@@ -36,8 +37,8 @@ class Config:
     DEEPSORT_BOX_SMOOTH_ALPHA = 0.65
 
     # === DECOUPLED BEHAVIOR PLUGINS (Registry Pattern in behaviors/) ===
-    # Add any registered plugin key here (e.g., "stopped", "restricted_zone") - zero if/else required!
-    ACTIVE_BEHAVIORS = ("stopped",)
+    # Add any registered plugin key here (e.g., "stopped", "restricted_zone", "calma_nathalia") - zero if/else required!
+    ACTIVE_BEHAVIORS = ("stopped", "calma_nathalia")
     STOPPED_SECONDS_THRESHOLD = 3
     STOPPED_PIXEL_THRESHOLD = 15
     MOVEMENT_BREAKOUT_THRESHOLD = 30
@@ -55,9 +56,10 @@ class Config:
 
     # === DECOUPLED DATA EXPORTERS (Registry Pattern in exporters/) ===
     # Add any registered exporter key here (e.g., ("csv",), ("csv", "kafka")) - zero if/else required!
-    ACTIVE_EXPORTERS = ("csv",)
+    ACTIVE_EXPORTERS = ("csv", "kafka")
     EXPORT_CSV_FILENAME = "tracking_data_final.csv"
-    KAFKA_EVENTS_TOPIC = "smartbuildings-eventos"
+    KAFKA_EVENTS_TOPIC = "Calma_Nathalia"
+    KAFKA_TELEMETRY_INTERVAL_SEC = 0.25
 
     # === UI & PRESENTATION ===
     DISPLAY_ENABLED = True

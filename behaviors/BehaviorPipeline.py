@@ -26,10 +26,12 @@ class BehaviorPipeline:
         if global_manager is None or not result.event_type:
             return
         if (result.is_active or was_active or force_sync) and hasattr(global_manager, "record_behavior_event"):
+            telemetry = result.telemetry or context.to_telemetry_dict()
             global_manager.record_behavior_event(
                 global_id=context.global_id, cam_id=context.cam_id, behavior_name=result.name,
                 event_type=result.event_type, is_active=result.is_active,
-                duration_seconds=result.duration_seconds, current_time=context.current_time, details=result.details,
+                duration_seconds=result.duration_seconds, current_time=context.current_time,
+                details=result.details, telemetry=telemetry,
             )
 
     def evaluate(self, context: TrackContext, global_manager=None, force_sync: bool = False) -> AnnotationSpec:

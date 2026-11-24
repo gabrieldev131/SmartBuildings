@@ -34,7 +34,9 @@ class ExportPipeline:
             "origin_camera": origin, "next_camera": next_env, "ambiente_id": f"Ambiente_{cluster}",
             "merged_cameras": merged, "cameras_path": path_str, "timestamp_in": t_in,
             "timestamp_out": t_out, "duration_seconds": dur, "stopped_seconds": stopped,
-            "reid_distance": 0.0, "details": f"Resumo Ambiente: ID {gid} em 'Ambiente_{cluster}' por {dur:.2f}s",
+            "reid_distance": 0.0, "reid_similarity_pct": 100.0, "people_in_camera": 1,
+            "object_class": "person", "class_id": 0, "confidence_pct": 100.0,
+            "details": f"Resumo Ambiente: ID {gid} em 'Ambiente_{cluster}' por {dur:.2f}s",
         }
 
     def aggregate_by_clusters(self, global_id: int, raw_history: list[dict]) -> list[dict]:
@@ -61,40 +63,48 @@ class ExportPipeline:
         merged = self.cluster_manager.get_cluster_label(cam_id) if cam_id else ""
         ident = all_identities.get(gid)
         path = " -> ".join(r["camera_id"] for r in ident.get_raw_history()) if ident else ev.get("cameras_path", cam_id)
+        dist = float(ev.get("reid_distance", 0.0))
         return {
-            "event_type": ev["event_type"], "global_id": gid, "camera_id": cam_id,
+            **ev, "event_type": ev["event_type"], "global_id": gid, "camera_id": cam_id,
             "origin_camera": ev.get("origin_camera", ""), "next_camera": ev.get("next_camera", ""),
             "ambiente_id": ev.get("ambiente_id") or (f"Ambiente_{root}" if root else ""),
             "merged_cameras": ev.get("merged_cameras") or merged, "cameras_path": ev.get("cameras_path") or path,
             "timestamp_in": float(ev["timestamp_in"]), "timestamp_out": float(ev["timestamp_out"]),
             "duration_seconds": float(ev.get("duration_seconds", 0.0)), "stopped_seconds": float(ev.get("stopped_seconds", 0.0)),
-            "reid_distance": float(ev.get("reid_distance", 0.0)), "details": ev.get("details", ""),
+            "reid_distance": dist, "reid_similarity_pct": float(ev.get("reid_similarity_pct", round(max(0.0, 1.0 - dist) * 100.0, 2))),
+            "people_in_camera": int(ev.get("people_in_camera", 1)), "object_class": str(ev.get("object_class", "person")),
+            "confidence_pct": float(ev.get("confidence_pct", 100.0)), "details": ev.get("details", ""),
         }
 
     def _build_passage_row(self, gid: int, rec: dict, full_path: str) -> dict:
         cam_id = rec["camera_id"]
         root, merged = self.cluster_manager.find(cam_id), self.cluster_manager.get_cluster_label(cam_id)
-        dur = float(rec["duration_seconds"])
+        dur, dist = float(rec["duration_seconds"]), float(rec["reid_distance"])
         return {
             "event_type": "CAMERA_PASSAGE", "global_id": gid, "camera_id": cam_id,
             "origin_camera": rec["origin_camera"], "next_camera": rec["next_camera"],
             "ambiente_id": f"Ambiente_{root}", "merged_cameras": merged, "cameras_path": full_path,
             "timestamp_in": float(rec["timestamp_in"]), "timestamp_out": float(rec["timestamp_out"]),
             "duration_seconds": dur, "stopped_seconds": float(rec["stopped_seconds"]),
-            "reid_distance": float(rec["reid_distance"]),
+            "reid_distance": dist, "reid_similarity_pct": round(max(0.0, 1.0 - dist) * 100.0, 2),
+            "people_in_camera": 1, "object_class": "person", "class_id": 0, "confidence_pct": 100.0,
             "details": f"Passagem: ID {gid} em '{cam_id}' ({dur:.2f}s) | Trajeto: [{full_path}]",
         }
 
     def _format_record(self, idx: int, r: dict) -> dict:
         t_in, t_out = float(r["timestamp_in"]), float(r["timestamp_out"])
+        dist = float(r.get("reid_distance", 0.0))
         return {
-            "event_index": idx, "event_type": r["event_type"], "global_id": r["global_id"],
+            **r, "event_index": idx, "event_type": r["event_type"], "global_id": r["global_id"],
             "camera_id": r["camera_id"], "origin_camera": r["origin_camera"], "next_camera": r["next_camera"],
             "ambiente_id": r["ambiente_id"], "merged_cameras": r["merged_cameras"], "cameras_path": r["cameras_path"],
+            "people_in_camera": int(r.get("people_in_camera", 1)), "object_class": str(r.get("object_class", "person")),
+            "confidence_pct": f"{float(r.get('confidence_pct', 100.0)):.2f}",
+            "reid_similarity_pct": f"{float(r.get('reid_similarity_pct', max(0.0, 1.0 - dist) * 100.0)):.2f}",
             "timestamp_in": f"{t_in:.3f}", "timestamp_out": f"{t_out:.3f}",
             "datetime_in": self.format_timestamp(t_in), "datetime_out": self.format_timestamp(t_out),
             "duration_seconds": f"{float(r['duration_seconds']):.3f}", "stopped_seconds": f"{float(r['stopped_seconds']):.3f}",
-            "reid_distance": f"{float(r['reid_distance']):.4f}", "details": r["details"],
+            "reid_distance": f"{dist:.4f}", "details": r["details"],
         }
 
     def build_records(self, all_identities: dict, events_copy: list[dict]) -> list[dict]:

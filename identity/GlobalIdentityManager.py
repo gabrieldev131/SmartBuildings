@@ -29,6 +29,8 @@ class GlobalIdentityManager(IIdentityRepository):
         self.archived_identities: dict[int, GlobalIdentity] = {}
         self.event_log: list[dict] = []
         self._active_stopped_events: dict[tuple[int, str, str], dict] = {}
+        self.camera_telemetry_cache: dict[str, dict] = {}
+        self.identity_telemetry_cache: dict[int, dict] = {}
         self.next_global_id, self._last_cleanup_time = 1, 0.0
         self._lock = threading.RLock()
 
@@ -51,6 +53,27 @@ class GlobalIdentityManager(IIdentityRepository):
         for gid in [g for g, ident in self.identities.items() if (current_time - ident.last_seen) > expiry]:
             self.archived_identities[gid] = self.identities.pop(gid)
 
+    def _enrich_event_telemetry(self, row: dict, gid: int, cam_id: str, dist: float, telemetry: Optional[dict] = None) -> None:
+        if telemetry:
+            self.camera_telemetry_cache[cam_id], self.identity_telemetry_cache[gid] = telemetry, telemetry
+        src = telemetry or self.identity_telemetry_cache.get(gid) or self.camera_telemetry_cache.get(cam_id) or {}
+        ident, root = self.identities.get(gid), (self.cluster_manager.find(cam_id) if cam_id else "")
+        merged = self.cluster_manager.get_cluster_label(cam_id) if cam_id else ""
+        path = " -> ".join(r["camera_id"] for r in ident.get_raw_history()) if ident else row.get("cameras_path", cam_id)
+        limiares = dict(src.get("limiares_percentuais", {}))
+        reid_sim_pct = round(max(0.0, (1.0 - float(dist))) * 100.0, 2)
+        limiares.update({"reid_similarity_pct": reid_sim_pct, "reid_distance_pct": round(float(dist) * 100.0, 2)})
+        row.update({
+            "kafka_topic": getattr(self.config, "KAFKA_EVENTS_TOPIC", "Calma_Nathalia"),
+            "ambiente_id": row.get("ambiente_id") or (f"Ambiente_{root}" if root else ""),
+            "merged_cameras": row.get("merged_cameras") or merged, "cameras_path": row.get("cameras_path") or path,
+            "people_in_camera": int(src.get("people_in_camera", max(1, len(self.identities)))),
+            "object_class": str(src.get("object_class", "person")), "class_id": int(src.get("class_id", 0)),
+            "confidence_pct": float(src.get("confidence_pct", 100.0)), "reid_similarity_pct": reid_sim_pct,
+            "limiares_percentuais": limiares, "camera_summary": dict(src.get("camera_summary", {})),
+            "yolo": dict(src.get("yolo", {})), "deepsort": dict(src.get("deepsort", {})),
+        })
+
     def _log_event(self, ev_type: str, gid: int, cam_id: str, origin: str, nxt: str, t_in: float, t_out: float, dist: float, details: str, **extra) -> None:
         row = {
             "event_type": ev_type, "global_id": gid, "camera_id": cam_id, "origin_camera": origin,
@@ -59,6 +82,7 @@ class GlobalIdentityManager(IIdentityRepository):
             "reid_distance": float(dist), "details": details,
         }
         row.update(extra)
+        self._enrich_event_telemetry(row, gid, cam_id, dist)
         self.event_log.append(row)
         self.export_pipeline.notify_event(row)
 
@@ -193,32 +217,35 @@ class GlobalIdentityManager(IIdentityRepository):
             ident = self.identities.get(global_id)
             return ident.current_camera if ident is not None else None
 
-    def _upsert_behavior_log(self, key: tuple[int, str, str], ev_type: str, behavior_name: str, duration: float, current_time: float, details: str) -> None:
+    def _upsert_behavior_log(self, key: tuple[int, str, str], ev_type: str, behavior_name: str, duration: float, current_time: float, details: str, telemetry: Optional[dict] = None) -> None:
         gid, cam_id, _ = key
+        ident = self.identities.get(gid)
+        dist = float(ident.passage_records[-1].get("reid_distance", 0.0)) if (ident and ident.passage_records) else 0.0
         desc = details or f"Evento '{ev_type}' para ID {gid} em '{cam_id}' ({duration:.1f}s)"
-        if key not in self._active_stopped_events:
-            ev = {
-                "event_type": ev_type, "global_id": gid, "camera_id": cam_id, "origin_camera": cam_id, "next_camera": cam_id,
-                "timestamp_in": current_time - duration, "timestamp_out": current_time, "duration_seconds": duration,
-                "stopped_seconds": duration if behavior_name == "stopped" else 0.0, "reid_distance": 0.0, "details": desc,
-            }
+        is_new = key not in self._active_stopped_events
+        ev = self._active_stopped_events.get(key) or {
+            "event_type": ev_type, "global_id": gid, "camera_id": cam_id, "origin_camera": cam_id, "next_camera": cam_id,
+            "timestamp_in": current_time - duration, "timestamp_out": current_time, "duration_seconds": duration,
+            "stopped_seconds": duration if behavior_name == "stopped" else 0.0, "reid_distance": dist, "details": desc,
+        }
+        ev.update({"timestamp_out": current_time, "duration_seconds": duration, "details": desc, "reid_distance": dist})
+        if behavior_name == "stopped":
+            ev["stopped_seconds"] = duration
+        self._enrich_event_telemetry(ev, gid, cam_id, dist, telemetry)
+        if is_new:
             self._active_stopped_events[key] = ev
             self.event_log.append(ev)
-            self.export_pipeline.notify_event(ev)
-        else:
-            ev = self._active_stopped_events[key]
-            ev["timestamp_out"], ev["duration_seconds"], ev["details"] = current_time, duration, desc
-            if behavior_name == "stopped":
-                ev["stopped_seconds"] = duration
+        self.export_pipeline.notify_event(ev)
 
-    def record_behavior_event(self, global_id: int, cam_id: str, behavior_name: str, event_type: str, is_active: bool, duration_seconds: float, current_time: float, details: str = "") -> None:
+    def record_behavior_event(self, global_id: int, cam_id: str, behavior_name: str, event_type: str, is_active: bool, duration_seconds: float, current_time: float, details: str = "", telemetry: Optional[dict] = None) -> None:
         with self._lock:
             ident = self.identities.get(global_id)
             if ident is not None and ident.current_camera == cam_id and behavior_name == "stopped" and is_active and duration_seconds > 0.0:
                 ident.update_stopped_duration(cam_id, duration_seconds, current_time)
             key = (global_id, cam_id, behavior_name)
-            if is_active and duration_seconds > 0.0 and (ident is None or ident.current_camera == cam_id):
-                self._upsert_behavior_log(key, event_type, behavior_name, duration_seconds, current_time, details)
+            valid_dur = (duration_seconds >= 0.0) if behavior_name != "stopped" else (duration_seconds > 0.0)
+            if is_active and valid_dur and (ident is None or ident.current_camera == cam_id):
+                self._upsert_behavior_log(key, event_type, behavior_name, duration_seconds, current_time, details, telemetry)
             else:
                 self._active_stopped_events.pop(key, None)
 
