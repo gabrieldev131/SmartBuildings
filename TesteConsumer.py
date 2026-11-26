@@ -14,8 +14,11 @@ print(f"A aguardar mensagens do tópico '{Config.KAFKA_EVENTS_TOPIC}'...")
 try:
     while True:
         msg = consumer.poll(timeout=1.0)
-        if msg is None or msg.error():
-            print(msg.error() if msg else "Sem mensagens recebidas.")
+        if msg is None:
+            print("Sem mensagens recebidas.")
+            continue
+        if msg.error():
+            print(f"Erro ao consumir mensagem: {msg.error()}")
             continue
 
         key = msg.key().decode("utf-8") if msg.key() else ""
@@ -29,13 +32,10 @@ try:
         yolo_info = data.get("yolo", {})
         deepsort_info = data.get("deepsort", {})
 
-        print(
-            f"[Cam: {cam_id}] Pessoas: {people_count} | "
-            f"ID Global: {data.get('global_id')} | Classe: {obj_class} | "
-            f"Conf YOLO: {limiares.get('yolo_confidence_pct')}% | "
-            f"Ocupação: {limiares.get('camera_occupancy_pct')}% | "
-            f"Vel DeepSort: {deepsort_info.get('speed_px_per_sec')} px/s"
-        )
+        if cam_id == "cam2":
+            print(
+                data.get("deepsort", {}).get("age")
+            )
 except KeyboardInterrupt:
     pass
 finally:
